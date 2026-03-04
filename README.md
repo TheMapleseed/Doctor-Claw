@@ -1,5 +1,7 @@
 # Doctor Claw
 
+![Doctor Claw](images/DoctorClaw.jpg)
+
 **Zero overhead. Zero compromise. 100% C.**
 
 An autonomous AI agent written in ISO C23. No interpreters, no runtimes—just a single binary that talks to OpenRouter/OpenAI, runs tools (shell, files, HTTP, memory, cron), and keeps working on a task until it’s done.
@@ -127,4 +129,4 @@ Other routes: `GET /`, `GET /health`, webhook endpoints for Telegram/Discord/Sla
 
 ## License
 
-See repository license file (if present). Otherwise use at your own discretion.
+GPLv3. See [LICENSE](LICENSE) for the full terms.
