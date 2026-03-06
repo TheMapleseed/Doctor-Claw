@@ -286,7 +286,7 @@ static int slack_send_typing(const channel_config_t *config) {
     return 0;
 }
 
-static int slack_mark_read(const channel_config_t *config) {
+static __attribute__((unused)) int slack_mark_read(const channel_config_t *config) {
     char url[512];
     char body[512];
     char auth_header[512];
@@ -443,8 +443,6 @@ static int matrix_send_message(const channel_config_t *config, const char *conte
     snprintf(url, sizeof(url), "https://matrix.org/_matrix/client/v3/rooms/%s/send/m.room.message",
              config->webhook_url[0] ? config->webhook_url : "main");
     
-    const char *txn_id = "msg123";
-    
     snprintf(body, sizeof(body),
         "{\"msgtype\":\"m.text\",\"body\":\"%s\"}",
         content);
@@ -569,7 +567,7 @@ static int lark_send_message(const channel_config_t *config, const char *content
     return result;
 }
 
-static int mattermost_send_message(const channel_config_t *config, const char *content) {
+static __attribute__((unused)) int mattermost_send_message(const channel_config_t *config, const char *content) {
     if (!config || !content || !config->api_key[0]) return -1;
     
     char url[512];

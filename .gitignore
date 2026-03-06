@@ -16,3 +16,8 @@ obj/
 # Local config / secrets (optional)
 .env
 *.local
+
+# Logs and temp
+*.log
+*.tmp
+*.temp

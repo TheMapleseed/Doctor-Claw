@@ -161,9 +161,11 @@ void identity_free(identity_t *id) {
     }
 }
 
-static void hmac_sha256(const unsigned char *key, size_t key_len, 
+static void hmac_sha256(const unsigned char *key, size_t key_len,
                         const char *message, size_t msg_len,
                         unsigned char *output) {
+    (void)message;
+    (void)msg_len;
     const unsigned char ipad[64] = {0x36};
     const unsigned char opad[64] = {0x5C};
     

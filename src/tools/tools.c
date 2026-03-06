@@ -44,7 +44,7 @@ static size_t g_env_var_count = 0;
 static security_policy_t g_shell_policy = {0};
 static char g_workspace_dir[512] = {0};
 static bool g_shell_policy_initialized = false;
-static bool g_sandbox_enabled = false;
+static bool g_sandbox_enabled __attribute__((unused)) = false;
 static approval_manager_t *g_approval_manager = NULL;
 static bool g_require_approval = false;
 
@@ -382,7 +382,7 @@ static int check_dangerous_command(const char *command) {
     return 0;
 }
 
-static int is_path_in_workspace(const char *path) {
+static __attribute__((unused)) int is_path_in_workspace(const char *path) {
     if (!path || !g_workspace_dir[0]) return 0;
     
     char resolved[PATH_MAX];
@@ -1383,7 +1383,7 @@ int tool_web_search_execute(const char *params, tool_result_t *result) {
 
 int tool_screenshot_execute(const char *params, tool_result_t *result) {
     char *output_path = parse_string_param(params, "output");
-    char *full_screen_str = parse_string_param(params, "full_screen");
+    (void)parse_string_param(params, "full_screen");
     
     if (!output_path) {
         output_path = "screenshot.png";
@@ -1913,7 +1913,7 @@ static char g_cron_runs_store[100][512];
 static size_t g_cron_runs_count = 0;
 
 int tool_cron_runs_execute(const char *params, tool_result_t *result) {
-    char *job_id = parse_string_param(params, "job_id");
+    (void)parse_string_param(params, "job_id");
     char *limit_str = parse_string_param(params, "limit");
     
     int limit = limit_str ? atoi(limit_str) : 10;
@@ -2080,7 +2080,7 @@ void record_cron_run(const char *job_info) {
 int tool_browser_execute(const char *params, tool_result_t *result) {
     char *url = parse_string_param(params, "url");
     char *action = parse_string_param(params, "action");
-    char *selector = parse_string_param(params, "selector");
+    (void)parse_string_param(params, "selector");
     
     if (!url) {
         snprintf(result->error, sizeof(result->error), "URL required");

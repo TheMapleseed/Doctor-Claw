@@ -272,6 +272,8 @@ static int cmd_gateway(int argc, char **argv) {
 }
 
 static int cmd_daemon(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("[DoctorClaw] Daemon mode\n");
     printf("===================\n\n");
     
@@ -355,6 +357,8 @@ static int cmd_service(int argc, char **argv) {
 }
 
 static int cmd_doctor(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("[DoctorClaw] Running diagnostics...\n\n");
     
     doctor_report_t report;
@@ -367,6 +371,8 @@ static int cmd_doctor(int argc, char **argv) {
 }
 
 static int cmd_status(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("Doctor Claw Status\n");
     printf("==================\n\n");
     printf("Version:     %s\n", DoctorClaw_VERSION);
@@ -427,6 +433,8 @@ static int cmd_cron(int argc, char **argv) {
 }
 
 static int cmd_models(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("Available Models\n");
     printf("================\n\n");
     
@@ -454,6 +462,8 @@ static int cmd_models(int argc, char **argv) {
 }
 
 static int cmd_providers(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("Supported AI Providers\n");
     printf("=====================\n\n");
     
@@ -550,6 +560,8 @@ static int cmd_channel(int argc, char **argv) {
 }
 
 static int cmd_integrations(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("[DoctorClaw] Integrations\n");
     printf("======================\n\n");
     
@@ -729,6 +741,8 @@ static int cmd_auth(int argc, char **argv) {
 }
 
 static int cmd_hardware(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     printf("[DoctorClaw] Hardware discovery\n");
     printf("===========================\n\n");
     

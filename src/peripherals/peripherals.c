@@ -157,7 +157,6 @@ int peripheral_hardware_discover(void) {
     printf("[Peripherals] Discovering USB devices...\n");
     
 #ifdef __APPLE__
-    const char *dev_path = "/dev/cu.";
     DIR *d = opendir("/dev");
     if (d) {
         struct dirent *entry;
@@ -222,7 +221,6 @@ int uno_q_bridge(const char *port) {
 int capabilities_discover(void) {
     printf("[Peripherals] Discovering board capabilities...\n");
     
-    char cmd[256];
     FILE *fp = popen("ls /sys/class/gpio 2>/dev/null", "r");
     if (fp) {
         char line[64];

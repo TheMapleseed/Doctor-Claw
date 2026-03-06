@@ -38,7 +38,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     return realsize;
 }
 
-static void url_encode(const char *src, char *dest, size_t dest_len) {
+static __attribute__((unused)) void url_encode(const char *src, char *dest, size_t dest_len) {
     const char *hex = "0123456789ABCDEF";
     size_t j = 0;
     
@@ -147,6 +147,7 @@ static int find_json_array_value(const char *json, const char *key, int index, c
 }
 
 static void check_rate_limit(provider_type_t type) {
+    (void)type;
     time_t now = time(NULL);
     
     for (size_t i = 0; i < g_rate_limit_count; i++) {
@@ -163,6 +164,7 @@ static void check_rate_limit(provider_type_t type) {
 }
 
 static void update_rate_limit(provider_type_t type) {
+    (void)type;
     time_t now = time(NULL);
     
     for (size_t i = 0; i < g_rate_limit_count; i++) {
@@ -1158,7 +1160,6 @@ int provider_openai_with_tools(const char *api_key, const char *model, const cha
                                         strncpy(call_json, call_start, call_len);
                                         
                                         char func_name[128] = {0};
-                                        char func_args[4096] = {0};
                                         
                                         if (find_json_value(call_json, "function", func_name, sizeof(func_name)) == 0) {
                                             if (strstr(func_name, "{")) {

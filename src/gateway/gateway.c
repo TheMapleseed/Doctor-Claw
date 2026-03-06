@@ -105,7 +105,7 @@ static int handle_ws_request(const http_request_t *req, int client_fd) {
     const char *upgrade = get_header(req, "Upgrade");
     const char *connection = get_header(req, "Connection");
     const char *ws_key = get_header(req, "Sec-WebSocket-Key");
-    const char *ws_version = get_header(req, "Sec-WebSocket-Version");
+    (void)get_header(req, "Sec-WebSocket-Version");
     
     if (!upgrade || !connection || !ws_key) {
         return -1;

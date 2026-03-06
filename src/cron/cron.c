@@ -27,10 +27,10 @@ typedef struct {
 static cron_task_t g_tasks[MAX_TASKS];
 static size_t g_task_count = 0;
 static pthread_mutex_t g_cron_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int g_cron_running = 0;
-static pthread_t g_cron_thread;
+static int g_cron_running __attribute__((unused)) = 0;
+static pthread_t g_cron_thread __attribute__((unused));
 
-static int parse_cron_expression(const char *expression, time_t *next_run);
+static __attribute__((unused)) int parse_cron_expression(const char *expression, time_t *next_run);
 static time_t calculate_next_run(const char *expression, time_t from_time);
 static int save_tasks_to_disk(void);
 static int load_tasks_from_disk(void);
@@ -126,12 +126,7 @@ static int load_tasks_from_disk(void) {
 
 static time_t calculate_next_run(const char *expression, time_t from_time) {
     struct tm *tm = localtime(&from_time);
-    int minute = tm->tm_min;
-    int hour = tm->tm_hour;
-    int day = tm->tm_mday;
-    int month = tm->tm_mon + 1;
-    int wday = tm->tm_wday;
-    
+    (void)tm;
     char fields[6][32] = {0};
     int field_idx = 0;
     char *expr_copy = strdup(expression);
@@ -148,7 +143,6 @@ static time_t calculate_next_run(const char *expression, time_t from_time) {
         return from_time + 60;
     }
     
-    int intervals[] = {60, 3600, 86400, 2592000, 31536000};
     int interval = 60;
     
     if (strcmp(fields[0], "*") != 0) {

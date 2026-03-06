@@ -339,6 +339,7 @@ int github_list_issues(const char *token, const char *owner, const char *repo, i
 }
 
 int jira_search_issues(const char *token, const char *base_url, const char *jql, int limit, jira_issue_t *out_issues, size_t *out_count) {
+    (void)limit;
     if (!token || !base_url || !jql || !out_issues || !out_count) return -1;
     
     *out_count = 0;
@@ -346,6 +347,7 @@ int jira_search_issues(const char *token, const char *base_url, const char *jql,
 }
 
 int jira_create_issue(const char *token, const char *base_url, const char *project, const char *summary, const char *description, char *out_key, size_t key_size) {
+    (void)description;
     if (!token || !base_url || !project || !summary || !out_key) return -1;
     
     snprintf(out_key, key_size, "%s-001", project);
@@ -410,6 +412,7 @@ int notion_get_page(const char *token, const char *page_id, notion_page_t *out) 
 }
 
 int notion_create_page(const char *token, const char *parent_id, const char *title, const char *content, char *out_id, size_t id_size) {
+    (void)content;
     if (!token || !title || !out_id) return -1;
     
     CURL *curl = curl_easy_init();

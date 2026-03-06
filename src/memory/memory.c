@@ -423,6 +423,7 @@ void memory_embedder_free(void) {
 static cache_config_t g_cache_config = {0};
 
 int memory_response_cache_init(const char *workspace_dir, const cache_config_t *config) {
+    (void)workspace_dir;
     if (!config) return -1;
     
     memcpy(&g_cache_config, config, sizeof(cache_config_t));
@@ -437,8 +438,10 @@ void memory_response_cache_free(void) {
     printf("[Memory] Response cache freed\n");
 }
 
-int memory_search_similar(memory_t *mem, const double *query_embedding, size_t dim, 
+int memory_search_similar(memory_t *mem, const double *query_embedding, size_t dim,
                          memory_item_t **results, size_t *result_count) {
+    (void)query_embedding;
+    (void)dim;
     if (!mem || !results || !result_count) return -1;
     
     *results = NULL;
@@ -494,15 +497,15 @@ int memory_delete(memory_t *mem, const char *key) {
     
     if (mem->backend == MEMORY_BACKEND_SQLITE && mem->db_handle) {
         sqlite3 *db = (sqlite3 *)mem->db_handle;
-        
-        char sql[MAX_SQL_LEN];
-        snprintf(sql, sizeof(sql), "DELETE FROM memory WHERE key = '%s'", key);
-        
-        char *err = NULL;
-        int result = sqlite3_exec(db, sql, NULL, NULL, &err);
-        if (err) sqlite3_free(err);
-        
-        return result == SQLITE_OK ? 0 : -1;
+        sqlite3_stmt *stmt = NULL;
+        const char *sql = "DELETE FROM memory WHERE key = ?1";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            return -1;
+        }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+        int result = (sqlite3_step(stmt) == SQLITE_DONE) ? 0 : -1;
+        sqlite3_finalize(stmt);
+        return result;
     }
     
     return -1;
@@ -734,7 +737,7 @@ int memory_vector_search(memory_t *mem, const embedding_t *query, size_t top_k, 
     
     while (sqlite3_step(stmt) == SQLITE_ROW && count < (int)top_k) {
         const char *key = (const char *)sqlite3_column_text(stmt, 0);
-        const char *value = (const char *)sqlite3_column_text(stmt, 1);
+        (void)sqlite3_column_text(stmt, 1);
         
         if (key) {
             embedding_t item_emb = {0};

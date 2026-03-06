@@ -124,6 +124,22 @@ Other routes: `GET /`, `GET /health`, webhook endpoints for Telegram/Discord/Sla
 - **C23** — The code targets ISO C23 (`-std=c23`). The Makefile uses Clang by default.
 - **Clean:** `make clean && make`
 - **Check:** `make check` runs `./bin/doctorclaw --help`
+- **Tests:** The test suite runs automatically as part of `make`. The build fails if any test fails. Run tests only with `make test`.
+
+### Test suite
+
+- **Location:** `tests/` — `test_harness.h` (macros), `test_main.c` (runner), and per-module tests:
+  - **config** — defaults, load from file, env overlay
+  - **memory** — backend classify, sqlite create/store/recall/delete
+  - **tools** — tools_list, tools_execute (cron_list, env, unknown)
+  - **cron** — init/shutdown, add/remove task, run_pending
+  - **approval** — init/free, request/respond, auto_approve, denied
+  - **auth** — init, add/remove profile, set_active/get_active, provider name, save/load
+  - **doctor** — init, run_checks
+  - **runtime** — init, get_info
+  - **util** — trim_whitespace, hex encode/decode, strdup, base64
+- **Build:** `bin/doctorclaw_test` is built from app objects (excluding `main.c`) plus test sources and is executed by the `test` target.
+- **Adding tests:** Add a new `test_*.c` in `tests/` that includes `test_harness.h` and implements a `test_<module>_run(void)` returning the number of failures; declare and call it from `test_main.c`.
 
 ---
 

@@ -109,7 +109,7 @@ int observability_prometheus_export(observability_t *obs, char *output, size_t o
     pthread_mutex_lock(&g_obs_mutex);
     
     size_t offset = 0;
-    time_t now = time(NULL);
+    (void)time(NULL);
     
     offset += snprintf(output + offset, output_size - offset, "# HELP doctorclaw_metric A metric\n");
     offset += snprintf(output + offset, output_size - offset, "# TYPE doctorclaw_metric gauge\n");

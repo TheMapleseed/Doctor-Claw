@@ -24,6 +24,7 @@ typedef struct {
 static llama_backend_t g_llama = {0};
 
 int llama_init(llama_model_t *model, const llama_config_t *config) {
+    (void)config;
     if (!model) return -1;
     
     memset(model, 0, sizeof(llama_model_t));
@@ -39,16 +40,16 @@ int llama_init(llama_model_t *model, const llama_config_t *config) {
         return -1;
     }
     
-    g_llama.llama_init_from_file = dlsym(g_llama.lib_handle, "llama_init_from_file");
-    g_llama.llama_free_ctx = dlsym(g_llama.lib_handle, "llama_free");
-    g_llama.llama_eval = dlsym(g_llama.lib_handle, "llama_eval");
-    g_llama.llama_token_eos = dlsym(g_llama.lib_handle, "llama_token_eos");
-    g_llama.llama_token_to_str = dlsym(g_llama.lib_handle, "llama_token_to_str");
-    g_llama.llama_n_vocab = dlsym(g_llama.lib_handle, "llama_n_vocab");
-    g_llama.llama_get_kv_cache_token_count = dlsym(g_llama.lib_handle, "llama_get_kv_cache_token_count");
-    g_llama.llama_reset_kv_cache = dlsym(g_llama.lib_handle, "llama_reset_kv_cache");
-    g_llama.llama_tokenize = dlsym(g_llama.lib_handle, "llama_tokenize");
-    g_llama.llama_model_name = dlsym(g_llama.lib_handle, "llama_model_name");
+    *(void **)&g_llama.llama_init_from_file = dlsym(g_llama.lib_handle, "llama_init_from_file");
+    *(void **)&g_llama.llama_free_ctx = dlsym(g_llama.lib_handle, "llama_free");
+    *(void **)&g_llama.llama_eval = dlsym(g_llama.lib_handle, "llama_eval");
+    *(void **)&g_llama.llama_token_eos = dlsym(g_llama.lib_handle, "llama_token_eos");
+    *(void **)&g_llama.llama_token_to_str = dlsym(g_llama.lib_handle, "llama_token_to_str");
+    *(void **)&g_llama.llama_n_vocab = dlsym(g_llama.lib_handle, "llama_n_vocab");
+    *(void **)&g_llama.llama_get_kv_cache_token_count = dlsym(g_llama.lib_handle, "llama_get_kv_cache_token_count");
+    *(void **)&g_llama.llama_reset_kv_cache = dlsym(g_llama.lib_handle, "llama_reset_kv_cache");
+    *(void **)&g_llama.llama_tokenize = dlsym(g_llama.lib_handle, "llama_tokenize");
+    *(void **)&g_llama.llama_model_name = dlsym(g_llama.lib_handle, "llama_model_name");
     
     if (!g_llama.llama_init_from_file || !g_llama.llama_free_ctx) {
         printf("[Llama] Error: Failed to load llama.cpp functions\n");
@@ -114,6 +115,8 @@ int llama_chat_completion_with_config(
     size_t max_tokens,
     llama_response_t *response
 ) {
+    (void)temperature;
+    (void)seed;
     if (!model || !model->loaded || !prompt || !response) return -1;
     
     memset(response, 0, sizeof(llama_response_t));

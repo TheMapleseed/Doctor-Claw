@@ -34,7 +34,7 @@ typedef struct {
 
 static dispatcher_type_t g_dispatcher_type = DISPATCHER_NATIVE;
 
-static void dispatcher_set_type(dispatcher_type_t type) {
+static __attribute__((unused)) void dispatcher_set_type(dispatcher_type_t type) {
     g_dispatcher_type = type;
 }
 
@@ -58,7 +58,6 @@ static int parse_xml_tool_calls(const char *response, parsed_tool_call_t *calls,
                 char tool_xml[MAX_TOOL_ARGS] = {0};
                 memcpy(tool_xml, ptr + matches[1].rm_so, match_len);
                 
-                char name[128] = {0};
                 char args[MAX_TOOL_ARGS] = {0};
                 
                 regex_t name_re, args_re;
@@ -344,7 +343,7 @@ static const char *g_default_tools = "[\n"
 "  }\n"
 "]";
 
-static const char *INTENT_KEYWORDS[] = {
+static __attribute__((unused)) const char *INTENT_KEYWORDS[] = {
     "code", "function", "class", "implement", "write", "create", "build",
     "search", "find", "look", "query",
     "read", "write", "edit", "delete", "copy", "move", "file", "directory",
@@ -491,7 +490,7 @@ int agent_build_prompt(agent_t *agent, const char *context, char *prompt, size_t
     return 0;
 }
 
-static int agent_think(agent_t *agent, const char *user_message, char *response, size_t resp_size) {
+static __attribute__((unused)) int agent_think(agent_t *agent, const char *user_message, char *response, size_t resp_size) {
     chat_context_add_message(&agent->context, "user", user_message);
     
     provider_type_t ptype = PROVIDER_OPENROUTER;
@@ -529,7 +528,8 @@ static int agent_think(agent_t *agent, const char *user_message, char *response,
     return 0;
 }
 
-static int agent_execute_tool_call(agent_t *agent, const char *tool_call_json, char *result, size_t result_size) {
+static __attribute__((unused)) int agent_execute_tool_call(agent_t *agent, const char *tool_call_json, char *result, size_t result_size) {
+    (void)agent;
     char tool_name[64] = {0};
     char params[4096] = {0};
     

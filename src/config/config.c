@@ -19,7 +19,7 @@ static void trim(char *s) {
 static int parse_ini_line(const char *line, char *section, size_t section_len,
                           char *key, size_t key_len, char *value, size_t value_len) {
     if (!line || !section || !key || !value) return -1;
-    section[0] = key[0] = value[0] = '\0';
+    key[0] = value[0] = '\0';
     while (*line && isspace((unsigned char)*line)) line++;
     if (*line == '#' || *line == ';' || *line == '\0') return 0;
     if (*line == '[') {

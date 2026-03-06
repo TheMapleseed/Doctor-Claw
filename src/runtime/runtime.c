@@ -73,7 +73,6 @@ void runtime_shutdown(void) {
 static int validate_workspace_path(const char *workspace) {
     if (!workspace) return -1;
     
-    char cmd[512];
     char resolved[PATH_MAX];
     
     if (realpath(workspace, resolved) == NULL) {
