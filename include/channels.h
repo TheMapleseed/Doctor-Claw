@@ -77,4 +77,12 @@ int channel_add_allowed_user(channel_t *ch, const char *user_id);
 int channel_remove_allowed_user(channel_t *ch, const char *user_id);
 bool channel_is_user_allowed(channel_t *ch, const char *user_id);
 
+/** Reply to an incoming webhook (parse path+body, send response_text to the channel). */
+int channels_reply_to_webhook(const char *path, const char *body, const char *response_text);
+
+/** Start background listeners (e.g. Telegram getUpdates). jobcache is jobcache_t* for enqueue. */
+int channel_start_listeners(const char *config_path, void *jobcache);
+/** Stop listeners. */
+void channel_stop_listeners(void);
+
 #endif

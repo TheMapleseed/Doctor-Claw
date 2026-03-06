@@ -10,6 +10,23 @@
 #include <pthread.h>
 
 static pthread_mutex_t g_obs_mutex = PTHREAD_MUTEX_INITIALIZER;
+static observability_t g_global_obs = {0};
+static int g_global_obs_inited = 0;
+
+void observability_global_init(void) {
+    if (g_global_obs_inited) return;
+    observability_init(&g_global_obs);
+    g_global_obs_inited = 1;
+}
+
+observability_t *observability_global_get(void) {
+    return &g_global_obs;
+}
+
+int observability_record_global(const char *name, double value) {
+    if (!g_global_obs_inited) return 0;
+    return observability_record(&g_global_obs, name, value);
+}
 
 int observability_init(observability_t *obs) {
     if (!obs) return -1;
@@ -109,24 +126,29 @@ int observability_prometheus_export(observability_t *obs, char *output, size_t o
     pthread_mutex_lock(&g_obs_mutex);
     
     size_t offset = 0;
-    (void)time(NULL);
+    offset += snprintf(output + offset, output_size - offset, "# HELP doctorclaw_http_requests_total Total HTTP requests\n");
+    offset += snprintf(output + offset, output_size - offset, "# TYPE doctorclaw_http_requests_total counter\n");
     
-    offset += snprintf(output + offset, output_size - offset, "# HELP doctorclaw_metric A metric\n");
-    offset += snprintf(output + offset, output_size - offset, "# TYPE doctorclaw_metric gauge\n");
-    
+    double sum_by_name[MAX_METRICS] = {0};
+    char names[MAX_METRICS][MAX_METRIC_NAME] = {{0}};
+    size_t num_names = 0;
     for (size_t i = 0; i < obs->count && offset < output_size - 100; i++) {
         metric_t *m = &obs->metrics[i];
-        
-        if (m->label_count > 0) {
-            offset += snprintf(output + offset, output_size - offset, 
-                "doctorclaw_%s{%s} %f %llu\n",
-                m->metric_name, m->labels[0], m->value, (unsigned long long)m->timestamp);
+        size_t j;
+        for (j = 0; j < num_names; j++)
+            if (strcmp(names[j], m->metric_name) == 0) break;
+        if (j >= num_names) {
+            if (num_names < MAX_METRICS) {
+                snprintf(names[num_names], sizeof(names[0]), "%s", m->metric_name);
+                sum_by_name[num_names] = m->value;
+                num_names++;
+            }
         } else {
-            offset += snprintf(output + offset, output_size - offset, 
-                "doctorclaw_%s %f %llu\n",
-                m->metric_name, m->value, (unsigned long long)m->timestamp);
+            sum_by_name[j] += m->value;
         }
     }
+    for (size_t j = 0; j < num_names && offset < output_size - 100; j++)
+        offset += snprintf(output + offset, output_size - offset, "doctorclaw_%s %f\n", names[j], sum_by_name[j]);
     
     pthread_mutex_unlock(&g_obs_mutex);
     

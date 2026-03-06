@@ -193,7 +193,7 @@ int daemon_run(config_t *config, const char *host, uint16_t port) {
     
     daemon_start(&ctx, config, host, port);
     
-    gateway_run(host, port, config);
+    gateway_run(host, port, config, NULL);
     
     while (g_running && ctx.state == DAEMON_STATE_RUNNING) {
         sleep(1);

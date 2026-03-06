@@ -76,6 +76,15 @@ int tools_register(const tool_impl_t *tool) {
     return 0;
 }
 
+void tools_set_workspace(const char *workspace_dir) {
+    if (!workspace_dir || !workspace_dir[0]) {
+        g_workspace_dir[0] = '\0';
+        return;
+    }
+    strncpy(g_workspace_dir, workspace_dir, sizeof(g_workspace_dir) - 1);
+    g_workspace_dir[sizeof(g_workspace_dir) - 1] = '\0';
+}
+
 void tools_set_approval_context(void *approval_manager, bool require_approval) {
     g_approval_manager = (approval_manager_t *)approval_manager;
     g_require_approval = require_approval;

@@ -33,7 +33,8 @@ typedef struct {
     void (*disconnect_handler)(int client_fd);
 } ws_server_t;
 
-int gateway_run(const char *host, uint16_t port, config_t *config);
+struct jobcache;
+int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcache *jobcache);
 
 int ws_init(ws_server_t *ws);
 int ws_add_client(ws_server_t *ws, int fd, const char *ip);

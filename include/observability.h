@@ -49,4 +49,9 @@ int observability_otlp_shutdown(observability_t *obs);
 
 int observability_log(const char *level, const char *message);
 
+/** Global default instance for gateway/daemon to record without passing obs. */
+void observability_global_init(void);
+observability_t *observability_global_get(void);
+int observability_record_global(const char *name, double value);
+
 #endif

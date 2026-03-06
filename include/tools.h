@@ -40,6 +40,8 @@ struct tool_impl {
 
 int tools_init(void);
 int tools_register(const tool_impl_t *tool);
+/** Set workspace root for path checks (file/shell sandbox). Call from agent_init or worker before tools_execute. */
+void tools_set_workspace(const char *workspace_dir);
 /** Set approval context for risky tools (shell, write, rm). Pass NULL to disable. */
 void tools_set_approval_context(void *approval_manager, bool require_approval);
 int tools_execute(const char *tool_name, const char *params, tool_result_t *result);

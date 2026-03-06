@@ -9,6 +9,8 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/stat.h>
 
 #include "config.h"
 #include "providers.h"
@@ -35,6 +37,11 @@
 #include "tunnel.h"
 #include "util.h"
 #include "gateway.h"
+#include "jobcache.h"
+#include "jobworker.h"
+#include "observability.h"
+#include "log.h"
+#include "migration.h"
 #include "cron.h"
 
 typedef enum {
@@ -56,6 +63,7 @@ typedef enum {
     CMD_HARDWARE,
     CMD_PERIPHERAL,
     CMD_VERIFY_TASK_FOCUS,
+    CMD_LOG,
     CMD_UNKNOWN
 } command_t;
 
@@ -87,6 +95,7 @@ static void print_usage(const char *prog) {
     printf("  hardware      Discover USB hardware\n");
     printf("  peripheral     Manage hardware peripherals\n");
     printf("  verify-task-focus  Verify task-focus (attention loop) functionality\n");
+    printf("  log            Logging utilities (export)\n");
     printf("\nOptions:\n");
     printf("  -h, --help     Show this help message\n");
     printf("  -v, --version  Show version information\n");
@@ -112,7 +121,32 @@ static command_t parse_command(const char *cmd) {
     if (strcmp(cmd, "hardware") == 0) return CMD_HARDWARE;
     if (strcmp(cmd, "peripheral") == 0) return CMD_PERIPHERAL;
     if (strcmp(cmd, "verify-task-focus") == 0) return CMD_VERIFY_TASK_FOCUS;
+    if (strcmp(cmd, "log") == 0) return CMD_LOG;
     return CMD_UNKNOWN;
+}
+
+static void ensure_log_dirs(const config_t *cfg) {
+    if (!cfg) return;
+    if (cfg->paths.workspace_dir[0]) mkdir(cfg->paths.workspace_dir, 0755);
+    if (cfg->paths.state_dir[0]) mkdir(cfg->paths.state_dir, 0755);
+    if (cfg->paths.data_dir[0]) mkdir(cfg->paths.data_dir, 0755);
+}
+
+static void configure_logging_default(const config_t *cfg) {
+    if (!cfg) return;
+    log_init();
+
+    const char *env_path = getenv("DOCTORCLAW_LOG_FILE");
+    if (env_path && env_path[0]) {
+        (void)log_set_file(env_path);
+        return;
+    }
+
+    if (cfg->paths.state_dir[0]) {
+        char path[MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/doctorclaw.log", cfg->paths.state_dir);
+        (void)log_set_file(path);
+    }
 }
 
 static int cmd_onboard(int argc, char **argv) {
@@ -255,7 +289,10 @@ static int cmd_gateway(int argc, char **argv) {
     config_t cfg;
     config_init_defaults(&cfg);
     config_load(NULL, &cfg);
-    
+    ensure_log_dirs(&cfg);
+    configure_logging_default(&cfg);
+    observability_global_init();
+
     printf("Starting HTTP server on http://%s:%d...\n", host, port);
     printf("Press Ctrl+C to stop\n\n");
     
@@ -268,14 +305,35 @@ static int cmd_gateway(int argc, char **argv) {
     printf("  POST /slack         - Slack events\n");
     printf("  POST /agent/chat    - Agent chat API\n");
     
-    return gateway_run(host, (uint16_t)port, &cfg);
+    return gateway_run(host, (uint16_t)port, &cfg, NULL);
+}
+
+typedef struct {
+    const char *host;
+    uint16_t port;
+    config_t *config;
+    jobcache_t *jobcache;
+} gateway_thread_args_t;
+
+static void *gateway_thread_fn(void *arg) {
+    gateway_thread_args_t *a = (gateway_thread_args_t *)arg;
+    (void)gateway_run(a->host, a->port, a->config, a->jobcache);
+    return NULL;
 }
 
 static int cmd_daemon(int argc, char **argv) {
     (void)argc;
     (void)argv;
-    printf("[DoctorClaw] Daemon mode\n");
+    printf("[DoctorClaw] Daemon mode (shared job cache, load-based workers)\n");
     printf("===================\n\n");
+    
+    config_t cfg;
+    config_load(NULL, &cfg);
+    ensure_log_dirs(&cfg);
+    configure_logging_default(&cfg);
+    observability_global_init();
+    uint16_t port = cfg.gateway.port;
+    if (port == 0) port = 8080;
     
     runtime_init();
     runtime_start();
@@ -283,11 +341,56 @@ static int cmd_daemon(int argc, char **argv) {
     runtime_info_t info;
     runtime_get_info(&info);
     
+    jobcache_t *cache = jobcache_create(256);
+    if (!cache) {
+        printf("[Daemon] Failed to create job cache\n");
+        runtime_stop();
+        runtime_shutdown();
+        return -1;
+    }
+    jobworker_pool_t *pool = jobworker_pool_create(cache, NULL, &cfg, 2, 16);
+    if (!pool) {
+        jobcache_destroy(cache);
+        runtime_stop();
+        runtime_shutdown();
+        return -1;
+    }
+    if (jobworker_pool_start(pool) != 0) {
+        jobworker_pool_destroy(pool);
+        jobcache_destroy(cache);
+        runtime_stop();
+        runtime_shutdown();
+        return -1;
+    }
+    cron_set_jobcache(cache);
+    
     printf("Daemon started with PID: %d\n", getpid());
     printf("State: Running\n");
     printf("Uptime: %lu seconds\n", (unsigned long)info.uptime_seconds);
+    printf("Gateway: http://%s:%u (agent, health, webhooks)\n", cfg.gateway.host[0] ? cfg.gateway.host : "0.0.0.0", (unsigned)port);
+    printf("Job cache: shared; workers: 2–16 (load-based)\n");
     
+    pthread_t gateway_thread;
+    gateway_thread_args_t gw_args = {
+        .host = cfg.gateway.host[0] ? cfg.gateway.host : "0.0.0.0",
+        .port = port,
+        .config = &cfg,
+        .jobcache = cache
+    };
+    if (pthread_create(&gateway_thread, NULL, gateway_thread_fn, &gw_args) != 0) {
+        printf("[Daemon] Warning: could not start gateway thread; HTTP will not be available.\n");
+    }
+
+    if (cfg.paths.workspace_dir[0]) {
+        char channels_path[MAX_PATH_LEN];
+        snprintf(channels_path, sizeof(channels_path), "%s/channels/config.toml", cfg.paths.workspace_dir);
+        if (channel_start_listeners(channels_path, cache) == 0) {
+            printf("[Daemon] Channel listeners started (Telegram poll)\n");
+        }
+    }
+
     printf("\nDaemon running... (Press Ctrl+C to stop)\n");
+    cron_set_workspace(cfg.paths.state_dir);
     cron_init();
 
     while (1) {
@@ -297,6 +400,10 @@ static int cmd_daemon(int argc, char **argv) {
         if (g_verbose) printf(".");
     }
 
+    cron_set_jobcache(NULL);
+    jobworker_pool_stop(pool);
+    jobworker_pool_destroy(pool);
+    jobcache_destroy(cache);
     cron_shutdown();
     runtime_stop();
     runtime_shutdown();
@@ -414,19 +521,49 @@ static int cmd_cron(int argc, char **argv) {
     printf("=======================\n\n");
     
     if (argc == 0) {
-        printf("Usage: doctorclaw cron <command>\n");
+        printf("Usage: doctorclaw cron <command> [args]\n");
         printf("Commands:\n");
-        printf("  list          List scheduled tasks\n");
-        printf("  add <spec>    Add a cron task\n");
-        printf("  remove <id>  Remove a task\n");
+        printf("  list                    List scheduled tasks\n");
+        printf("  add <id> <expr> <cmd>   Add a cron task (e.g. add job1 \"* * * * *\" \"echo hi\")\n");
+        printf("  remove <id>             Remove a task by id\n");
         return 0;
     }
     
     if (strcmp(argv[0], "list") == 0) {
-        printf("Scheduled tasks:\n");
-        printf("  (No tasks scheduled)\n");
-    } else if (strcmp(argv[0], "add") == 0 && argc >= 2) {
-        printf("Task '%s' would be added\n", argv[1]);
+        if (cron_init() == 0) {
+            cron_list_tasks();
+            cron_shutdown();
+        }
+    } else if (strcmp(argv[0], "add") == 0 && argc >= 4) {
+        const char *id = argv[1];
+        const char *expr = argv[2];
+        const char *cmd = argv[3];
+        if (cron_init() == 0) {
+            int r = cron_add_task(id, expr, cmd);
+            cron_shutdown();
+            if (r != 0) {
+                printf("Failed to add task (duplicate id or max tasks)\n");
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    } else if (strcmp(argv[0], "remove") == 0 && argc >= 2) {
+        const char *id = argv[1];
+        if (cron_init() == 0) {
+            int r = cron_remove_task(id);
+            cron_shutdown();
+            if (r != 0) {
+                printf("Task '%s' not found\n", id);
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    } else if ((strcmp(argv[0], "add") == 0 && argc < 4) || (strcmp(argv[0], "remove") == 0 && argc < 2)) {
+        printf("Usage: cron add <id> <expression> <command>\n");
+        printf("       cron remove <id>\n");
+        return -1;
     }
     
     return 0;
@@ -662,10 +799,46 @@ static int cmd_migrate(int argc, char **argv) {
         printf("  openai      - OpenAI\n");
         printf("  ollama      - Ollama\n");
         printf("  llamacpp    - llama.cpp\n");
-        printf("  generic     - Generic JSON export\n");
-    } else if (strcmp(argv[0], "run") == 0 && argc >= 2) {
-        printf("Running migration from '%s'...\n", argv[1]);
-        printf("(Migration not fully implemented)\n");
+        printf("  generic     - Generic JSON export (usage: migrate run generic <path-to.json>)\n");
+    } else if (strcmp(argv[0], "run") == 0 && argc >= 3) {
+        const char *source_name = argv[1];
+        const char *source_path = argv[2];
+        migration_source_t src = migration_source_from_name(source_name);
+        if (src == MIGRATION_SOURCE_NONE) {
+            printf("Unknown source '%s'. Use: generic, claude, openai, ollama, llamacpp.\n", source_name);
+            return -1;
+        }
+        if (src != MIGRATION_SOURCE_GENERIC) {
+            printf("Only 'generic' migration is implemented. Use: doctorclaw migrate run generic <path-to.json>\n");
+            return -1;
+        }
+        config_t cfg;
+        config_load(NULL, &cfg);
+        migration_manager_t mgr;
+        migration_manager_init(&mgr);
+        if (migration_add(&mgr, src, source_path, cfg.paths.workspace_dir) != 0) {
+            printf("Failed to add migration.\n");
+            return -1;
+        }
+        printf("Running migration from '%s' -> %s\n", source_path, cfg.paths.workspace_dir);
+        int r = migration_execute(&mgr, source_path);
+        migration_t *migrations = NULL;
+        size_t count = 0;
+        migration_list(&mgr, &migrations, &count);
+        if (migrations && count > 0 && migrations[0].state == MIGRATION_STATE_COMPLETED) {
+            printf("Migrated %zu items", migrations[0].items_migrated);
+            if (migrations[0].items_failed > 0)
+                printf(", %zu failed", migrations[0].items_failed);
+            printf(".\n");
+        } else if (migrations && count > 0 && migrations[0].error[0]) {
+            printf("Migration failed: %s\n", migrations[0].error);
+        }
+        migration_manager_free(&mgr);
+        return r != 0 ? -1 : 0;
+    } else if (strcmp(argv[0], "run") == 0 && argc < 3) {
+        printf("Usage: doctorclaw migrate run <source> <path>\n");
+        printf("  e.g. migrate run generic /path/to/export.json\n");
+        return -1;
     }
     
     return 0;
@@ -803,6 +976,39 @@ static int cmd_peripheral(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_log(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "Usage: doctorclaw log export <dest_path>\n");
+        return 1;
+    }
+
+    if (strcmp(argv[0], "export") != 0) {
+        fprintf(stderr, "Unknown log command: %s\n", argv[0]);
+        fprintf(stderr, "Usage: doctorclaw log export <dest_path>\n");
+        return 1;
+    }
+
+    if (argc < 2 || !argv[1] || !argv[1][0]) {
+        fprintf(stderr, "Usage: doctorclaw log export <dest_path>\n");
+        return 1;
+    }
+
+    config_t cfg;
+    config_load(NULL, &cfg);
+    ensure_log_dirs(&cfg);
+    configure_logging_default(&cfg);
+
+    const char *dest = argv[1];
+    if (log_export(dest) != 0) {
+        const char *src = log_get_file_path();
+        fprintf(stderr, "Failed to export log%s%s\n", src ? " from " : "", src ? src : "");
+        return 1;
+    }
+
+    printf("Exported log to %s\n", dest);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -899,6 +1105,9 @@ int main(int argc, char **argv) {
             break;
         case CMD_VERIFY_TASK_FOCUS:
             result = cmd_verify_task_focus(new_argc, new_argv);
+            break;
+        case CMD_LOG:
+            result = cmd_log(new_argc, new_argv);
             break;
         default:
             fprintf(stderr, "Command not implemented yet\n");

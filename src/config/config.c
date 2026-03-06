@@ -152,6 +152,54 @@ int config_load(const char *path, config_t *cfg) {
                     snprintf(cfg->gateway.host, sizeof(cfg->gateway.host), "%s", value);
                 else if (strcmp(key, "port") == 0)
                     cfg->gateway.port = (unsigned short)atoi(value);
+            } else if (strcmp(section, "memory") == 0) {
+                if (strcmp(key, "backend") == 0)
+                    snprintf(cfg->memory.backend, sizeof(cfg->memory.backend), "%s", value);
+                else if (strcmp(key, "auto_save") == 0)
+                    cfg->memory.auto_save = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                else if (strcmp(key, "chunk_size") == 0)
+                    cfg->memory.chunk_size = (size_t)atoi(value);
+                else if (strcmp(key, "snapshot_enabled") == 0)
+                    cfg->memory.snapshot_enabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+            } else if (strcmp(section, "autonomy") == 0) {
+                if (strcmp(key, "enabled") == 0)
+                    cfg->autonomy.enabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                else if (strcmp(key, "level") == 0) {
+                    if (strcmp(value, "full") == 0) cfg->autonomy.level = AUTONOMY_LEVEL_FULL;
+                    else if (strcmp(value, "restricted") == 0) cfg->autonomy.level = AUTONOMY_LEVEL_RESTRICTED;
+                    else if (strcmp(value, "none") == 0) cfg->autonomy.level = AUTONOMY_LEVEL_NONE;
+                    else cfg->autonomy.level = AUTONOMY_LEVEL_SUPERVISED;
+                    snprintf(cfg->autonomy.level_str, sizeof(cfg->autonomy.level_str), "%s", value);
+                } else if (strcmp(key, "workspace_only") == 0)
+                    cfg->autonomy.workspace_only = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                else if (strcmp(key, "max_actions_per_hour") == 0)
+                    cfg->autonomy.max_actions_per_hour = (unsigned int)atoi(value);
+                else if (strcmp(key, "max_cost_per_day_cents") == 0)
+                    cfg->autonomy.max_cost_per_day_cents = (unsigned int)atoi(value);
+                else if (strcmp(key, "require_approval") == 0)
+                    cfg->autonomy.require_approval = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+            } else if (strcmp(section, "observability") == 0) {
+                if (strcmp(key, "backend") == 0)
+                    snprintf(cfg->observability.backend, sizeof(cfg->observability.backend), "%s", value);
+                else if (strcmp(key, "verbose") == 0)
+                    cfg->observability.verbose = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                else if (strcmp(key, "otel_endpoint") == 0)
+                    snprintf(cfg->observability.otel_endpoint, sizeof(cfg->observability.otel_endpoint), "%s", value);
+                else if (strcmp(key, "otel_service_name") == 0)
+                    snprintf(cfg->observability.otel_service_name, sizeof(cfg->observability.otel_service_name), "%s", value);
+            } else if (strcmp(section, "agent") == 0) {
+                if (strcmp(key, "enabled") == 0)
+                    cfg->agent.enabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                else if (strcmp(key, "max_history_messages") == 0)
+                    cfg->agent.max_history_messages = (unsigned int)atoi(value);
+                else if (strcmp(key, "max_tool_iterations") == 0)
+                    cfg->agent.max_tool_iterations = (unsigned int)atoi(value);
+                else if (strcmp(key, "compact_threshold") == 0)
+                    cfg->agent.compact_threshold = (unsigned int)atoi(value);
+                else if (strcmp(key, "auto_save") == 0)
+                    cfg->agent.auto_save = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+                else if (strcmp(key, "tool_dispatcher") == 0)
+                    snprintf(cfg->agent.tool_dispatcher, sizeof(cfg->agent.tool_dispatcher), "%s", value);
             }
         }
         fclose(f);

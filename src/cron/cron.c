@@ -1,4 +1,6 @@
 #include "config.h"
+#include "cron.h"
+#include "jobcache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +14,10 @@
 
 #define MAX_TASKS 64
 #define CRON_DB_PATH ".doctorclaw/cron.db"
+#define CRON_STATE_DIR_MAX 512
+
+static jobcache_t *g_cron_jobcache = NULL;
+static char g_cron_state_dir[CRON_STATE_DIR_MAX] = {0};
 
 typedef struct {
     char id[64];
@@ -49,13 +55,28 @@ int cron_init(void) {
     return 0;
 }
 
+void cron_set_workspace(const char *state_dir) {
+    if (state_dir && state_dir[0]) {
+        strncpy(g_cron_state_dir, state_dir, CRON_STATE_DIR_MAX - 1);
+        g_cron_state_dir[CRON_STATE_DIR_MAX - 1] = '\0';
+    } else {
+        g_cron_state_dir[0] = '\0';
+    }
+}
+
 static int save_tasks_to_disk(void) {
     char db_path[512] = {0};
-    snprintf(db_path, sizeof(db_path), "%s/%s", getenv("HOME") ? getenv("HOME") : ".", CRON_DB_PATH);
-    
     char dir_path[512] = {0};
-    snprintf(dir_path, sizeof(dir_path), "%s/.doctorclaw", getenv("HOME") ? getenv("HOME") : ".");
-    mkdir(dir_path, 0755);
+    if (g_cron_state_dir[0]) {
+        snprintf(dir_path, sizeof(dir_path), "%s", g_cron_state_dir);
+        mkdir(dir_path, 0755);
+        snprintf(db_path, sizeof(db_path), "%s/cron.db", g_cron_state_dir);
+    } else {
+        const char *home = getenv("HOME") ? getenv("HOME") : ".";
+        snprintf(dir_path, sizeof(dir_path), "%s/.doctorclaw", home);
+        mkdir(dir_path, 0755);
+        snprintf(db_path, sizeof(db_path), "%s/%s", home, CRON_DB_PATH);
+    }
     
     FILE *f = fopen(db_path, "w");
     if (!f) return -1;
@@ -82,8 +103,10 @@ static int save_tasks_to_disk(void) {
 
 static int load_tasks_from_disk(void) {
     char db_path[512] = {0};
-    snprintf(db_path, sizeof(db_path), "%s/%s", getenv("HOME") ? getenv("HOME") : ".", CRON_DB_PATH);
-    
+    if (g_cron_state_dir[0])
+        snprintf(db_path, sizeof(db_path), "%s/cron.db", g_cron_state_dir);
+    else
+        snprintf(db_path, sizeof(db_path), "%s/%s", getenv("HOME") ? getenv("HOME") : ".", CRON_DB_PATH);
     FILE *f = fopen(db_path, "r");
     if (!f) return 0;
     
@@ -239,6 +262,10 @@ int cron_list_tasks(void) {
     return 0;
 }
 
+void cron_set_jobcache(jobcache_t *cache) {
+    g_cron_jobcache = cache;
+}
+
 int cron_run_pending(void) {
     pthread_mutex_lock(&g_cron_mutex);
     
@@ -250,17 +277,31 @@ int cron_run_pending(void) {
         if (!task->enabled) continue;
         if (now < task->next_run) continue;
         
-        printf("[Cron] Running task %s: %s\n", task->id, task->command);
-        
-        int result = system(task->command);
-        
-        task->last_run = now;
-        task->next_run = calculate_next_run(task->expression, now);
-        
-        if (result == 0) {
-            task->run_count++;
+        if (g_cron_jobcache) {
+            job_t job = {0};
+            job.type = JOB_CRON_RUN;
+            snprintf(job.instance_id, sizeof(job.instance_id), "default");
+            size_t cmd_len = strlen(task->command);
+            if (cmd_len >= sizeof(job.payload)) cmd_len = sizeof(job.payload) - 1;
+            memcpy(job.payload, task->command, cmd_len);
+            job.payload[cmd_len] = '\0';
+            job.payload_len = cmd_len;
+            if (jobcache_push(g_cron_jobcache, &job) == 0) {
+                printf("[Cron] Enqueued task %s to shared cache\n", task->id);
+                task->last_run = now;
+                task->next_run = calculate_next_run(task->expression, now);
+                task->run_count++;
+            }
         } else {
-            task->fail_count++;
+            printf("[Cron] Running task %s: %s\n", task->id, task->command);
+            int result = system(task->command);
+            task->last_run = now;
+            task->next_run = calculate_next_run(task->expression, now);
+            if (result == 0) {
+                task->run_count++;
+            } else {
+                task->fail_count++;
+            }
         }
     }
     

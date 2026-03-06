@@ -63,6 +63,8 @@ typedef struct {
     char current_task[1024];
     bool task_focus_enabled;
     int max_attention_rounds;
+    /** Workspace root (for RAG index path, etc.). */
+    char workspace_dir[512];
 } agent_t;
 
 typedef struct {

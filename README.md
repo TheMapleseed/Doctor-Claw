@@ -4,65 +4,107 @@
 
 **Zero overhead. Zero compromise. 100% C.**
 
-An autonomous AI agent written in ISO C23. No interpreters, no runtimes—just a single binary that talks to OpenRouter/OpenAI, runs tools (shell, files, HTTP, memory, cron), and keeps working on a task until it’s done.
+Doctor Claw is a **single-binary autonomous agent runtime** written in ISO **C23**. It can talk to LLM providers (OpenRouter/OpenAI/Anthropic), call tools (shell/files/HTTP/memory/cron), run behind an HTTP gateway, and operate as a long-running daemon with a shared in-process job queue.
+
+It’s built for **“give it a task and let it keep working”**: the agent can iterate tool calls + follow-ups until it declares completion.
 
 ---
 
-## What it does
+## What this is (and what it isn’t)
 
-- **Agent loop** — Chat with an LLM that can call tools (read/write files, run shell, HTTP, store/recall memory, manage cron).
-- **Task-focused attention** — Give it a task; it keeps iterating (tool calls + follow-ups) until it responds with `[TASK_COMPLETE]` or hits the round limit. No “one reply and stop” unless you want it.
-- **Gateway** — HTTP server with `/agent/chat`, webhooks, health; optional WebSocket. Use `task_focus: true` in the JSON body for the same “run until done” behavior.
-- **Config from file + env** — INI-style config file; env vars override (e.g. `OPENROUTER_API_KEY`, `DOCTORCLAW_WORKSPACE`).
-- **Channels, cron, migration** — Telegram/Discord/Slack scaffolding; cron persist + run in daemon; generic JSON import into memory.
+- **What it is**
+  - **A C23 agent runtime** with a tool-calling loop.
+  - **A local gateway** (`doctorclaw gateway`) exposing endpoints like `POST /agent/chat`, webhook receivers, `GET /health`, and `GET /metrics`.
+  - **A daemon** (`doctorclaw daemon`) that runs a shared job cache + worker pool and periodically runs cron tasks.
+  - **A workspace-scoped tool environment**: file and shell tools are scoped to `workspace_dir` (set from config/env).
+  - **A “bring your own provider” client**: OpenRouter/OpenAI/Anthropic keys are detected via env.
+  - **Channels**: Telegram (getUpdates poll in daemon), Discord, and Slack webhooks; agent replies are sent back to the channel when configured (`workspace_dir/channels/config.toml`).
+
+- **What it isn’t**
+  - A full TOML config system: the config file is currently parsed as a simple INI-style format even though the default filename is `config.toml`.
 
 ---
 
 ## Quick start
 
-**Requirements:** Clang (or GCC) with C23, libcurl, SQLite3. macOS/Linux.
+**Requirements:** Clang (or GCC) with C23, `libcurl`, `sqlite3`. macOS/Linux.
 
 ```bash
-# Build (requires C23)
 make
 
-# First-time setup: workspace, config, auth
+# One-time: create a workspace + configs
 ./bin/doctorclaw onboard
 
-# Run the agent (interactive; each message is a task until [TASK_COMPLETE])
-export OPENROUTER_API_KEY=your_key   # or OPENAI_API_KEY
+# Set an API key (choose one)
+export OPENROUTER_API_KEY="..."     # recommended
+# export OPENAI_API_KEY="..."
+# export ANTHROPIC_API_KEY="..."
+
+# Run interactive agent
 ./bin/doctorclaw agent
 ```
 
-In the agent prompt, type a task (e.g. “List files in the current directory and summarize them”). It will use tools and keep going until it marks the task complete or hits the attention round limit.
-
 ---
 
-## Commands
+## Commands (high level)
 
-| Command | Description |
-|--------|-------------|
-| `onboard` | Initialize workspace and config |
-| `agent` | Interactive agent (task-focused loop) |
-| `gateway` | Start HTTP server (e.g. `-p 8080`) |
-| `daemon` | Long-running runtime (cron, etc.) |
-| `doctor` | Diagnostics (config, env, providers, memory) |
-| `status` | Version and health |
-| `channel` | Channels: `list`, `add telegram\|discord\|slack`, `start` |
-| `cron` | Scheduled tasks |
-| `migrate` | Import from other runtimes (e.g. generic JSON → memory) |
-| `auth` | Auth profiles (list, add, remove) |
-| `verify-task-focus` | Verify task-focus / attention loop behavior |
+| Command | What it does |
+|--------|--------------|
+| `onboard` | Creates a local workspace, basic configs |
+| `agent` | Interactive agent loop (tool-calling + task focus) |
+| `gateway` | Starts HTTP server (`/agent/chat`, webhooks, `/health`, `/metrics`) |
+| `daemon` | Starts long-running runtime: worker pool + gateway thread + cron loop |
+| `doctor` | Diagnostics (config/env/provider/memory checks) |
+| `status` | Version + basic health |
+| `cron` | Cron management (persisted under `state_dir`) |
+| `channel` | Channel scaffolding (Telegram/Discord/Slack) |
+| `integrations` | Integration helpers (GitHub/Jira/Notion) |
+| `migrate` | Migration helpers (generic JSON import → memory) |
+| `auth` | Auth profile scaffolding |
+| `verify-task-focus` | Sanity check for task-focus behavior |
+| `log` | Logging utilities (`log export <dest_path>`) |
+
+Run `./bin/doctorclaw --help` for the full list.
 
 ---
 
 ## Task-focused mode (attention loop)
 
-By default, the interactive agent and (optionally) the HTTP API treat each input as a **task**: the agent keeps reasoning and calling tools until it replies with `[TASK_COMPLETE]` and a summary, or until a maximum number of “attention” rounds (default 5).
+Doctor Claw supports a task-focused interaction style: instead of responding once, the agent can keep iterating until it emits the marker **`[TASK_COMPLETE]`**, or a max “attention” round limit is reached.
 
-- **CLI:** Every prompt in `doctorclaw agent` is task-focused.
-- **HTTP:** `POST /agent/chat` with body `{"prompt": "Your task", "task_focus": true}`.
-- **Check:** `./bin/doctorclaw verify-task-focus` runs a quick sanity check.
+- **CLI:** `doctorclaw agent` is task-oriented.
+- **HTTP:** `POST /agent/chat` supports `"task_focus": true`.
+
+---
+
+## Gateway API
+
+```bash
+curl -X POST "http://localhost:8080/agent/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"List files in /tmp and summarize them","task_focus":true}'
+```
+
+Other common endpoints include:
+- `GET /` (index)
+- `GET /health`
+- `GET /metrics` (Prometheus-style metrics)
+- `POST /webhook`, `POST /telegram`, `POST /discord`, `POST /slack`
+
+---
+
+## Logging (file + export)
+
+Doctor Claw logs to **stdout**, and can also write to a **log file**.
+
+- **Default log file (gateway/daemon):** `state_dir/doctorclaw.log`
+- **Override:** set `DOCTORCLAW_LOG_FILE`
+
+Export the current log file:
+
+```bash
+./bin/doctorclaw log export ./doctorclaw.log
+```
 
 ---
 
@@ -70,33 +112,30 @@ By default, the interactive agent and (optionally) the HTTP API treat each input
 
 | Variable | Effect |
 |----------|--------|
-| `OPENROUTER_API_KEY` | Primary API key (default provider: openrouter) |
-| `OPENAI_API_KEY` | Fallback (provider: openai) |
-| `ANTHROPIC_API_KEY` | Fallback (provider: anthropic) |
-| `DOCTORCLAW_WORKSPACE` | Override workspace root |
+| `OPENROUTER_API_KEY` | Provider key (OpenRouter) |
+| `OPENAI_API_KEY` | Provider key (OpenAI) |
+| `ANTHROPIC_API_KEY` | Provider key (Anthropic) |
+| `DOCTORCLAW_WORKSPACE` | Overrides workspace root (also sets `state_dir` and `data_dir`) |
 | `DOCTORCLAW_CONFIG` | Config file path |
 | `DOCTORCLAW_PROVIDER` / `DOCTORCLAW_MODEL` | Default provider/model |
 | `DOCTORCLAW_GATEWAY_PORT` / `DOCTORCLAW_GATEWAY_HOST` | Gateway bind |
+| `DOCTORCLAW_LOG_FILE` | Log file path override |
 
-Run `doctorclaw doctor` to see which of these (and others) are detected.
+Run `doctorclaw doctor` to see which are detected.
 
 ---
 
-## Gateway API
+## Integrations (Jira / Notion)
 
-```bash
-# One-shot chat
-curl -X POST http://localhost:8080/agent/chat \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "What is 2+2?"}'
+`src/integrations/integrations.c` contains integration helpers:
 
-# Task-focused (run until [TASK_COMPLETE])
-curl -X POST http://localhost:8080/agent/chat \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "List files in /tmp and summarize", "task_focus": true}'
-```
+- **Jira**
+  - Search issues: `/rest/api/3/search` (JQL is URL-encoded)
+  - Create issue: `/rest/api/3/issue`
+- **Notion**
+  - Create page: parses the returned `id` and returns it to the caller
 
-Other routes: `GET /`, `GET /health`, webhook endpoints for Telegram/Discord/Slack.
+These are minimal implementations intended to be called by higher-level tools/flows.
 
 ---
 
@@ -104,45 +143,32 @@ Other routes: `GET /`, `GET /health`, webhook endpoints for Telegram/Discord/Sla
 
 ```
 ├── Makefile
-├── include/          # Headers (config, agent, tools, gateway, …)
-├── src/              # Implementation
-│   ├── agent/        # Agent loop, task-focus, tools wiring
-│   ├── config/       # Load/save, env overlay
-│   ├── gateway/      # HTTP + WebSocket
-│   ├── tools/        # Shell, file, HTTP, memory, cron, …
-│   ├── memory/       # SQLite store/recall
-│   ├── cron/         # Scheduler, persist, run
-│   └── …
-├── FEATURES_AND_RECOMMENDATIONS.md   # Full feature list and roadmap
-└── README.md
+├── include/
+├── src/
+│   ├── agent/
+│   ├── config/
+│   ├── gateway/
+│   ├── integrations/
+│   ├── log/
+│   ├── memory/
+│   ├── cron/
+│   └── ...
+├── FEATURES_AND_RECOMMENDATIONS.md
+└── WHATS_LEFT.md
 ```
 
 ---
 
-## Build
+## Build & test
 
-- **C23** — The code targets ISO C23 (`-std=c23`). The Makefile uses Clang by default.
-- **Clean:** `make clean && make`
-- **Check:** `make check` runs `./bin/doctorclaw --help`
-- **Tests:** The test suite runs automatically as part of `make`. The build fails if any test fails. Run tests only with `make test`.
+```bash
+make
+```
 
-### Test suite
-
-- **Location:** `tests/` — `test_harness.h` (macros), `test_main.c` (runner), and per-module tests:
-  - **config** — defaults, load from file, env overlay
-  - **memory** — backend classify, sqlite create/store/recall/delete
-  - **tools** — tools_list, tools_execute (cron_list, env, unknown)
-  - **cron** — init/shutdown, add/remove task, run_pending
-  - **approval** — init/free, request/respond, auto_approve, denied
-  - **auth** — init, add/remove profile, set_active/get_active, provider name, save/load
-  - **doctor** — init, run_checks
-  - **runtime** — init, get_info
-  - **util** — trim_whitespace, hex encode/decode, strdup, base64
-- **Build:** `bin/doctorclaw_test` is built from app objects (excluding `main.c`) plus test sources and is executed by the `test` target.
-- **Adding tests:** Add a new `test_*.c` in `tests/` that includes `test_harness.h` and implements a `test_<module>_run(void)` returning the number of failures; declare and call it from `test_main.c`.
+The test suite is executed as part of `make` and the build fails if any test fails.
 
 ---
 
 ## License
 
-GPLv3. See [LICENSE](LICENSE) for the full terms.
+GPLv3. See [LICENSE](LICENSE).

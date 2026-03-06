@@ -338,20 +338,148 @@ int github_list_issues(const char *token, const char *owner, const char *repo, i
     return 0;
 }
 
+static int parse_json_string(const char *json, const char *key, char *out, size_t out_size) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    size_t i = 0;
+    while (p[i] && p[i] != '"' && i < out_size - 1) {
+        if (p[i] == '\\') i++;
+        if (p[i]) out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return 0;
+}
+
+static void json_escape_str(const char *src, char *dst, size_t dst_size) {
+    size_t j = 0;
+    for (; src && *src && j < dst_size - 1; src++) {
+        if (*src == '"' || *src == '\\') {
+            if (j < dst_size - 2) { dst[j++] = '\\'; dst[j++] = *src; }
+        } else if (*src == '\n') {
+            if (j < dst_size - 2) { dst[j++] = '\\'; dst[j++] = 'n'; }
+        } else {
+            dst[j++] = *src;
+        }
+    }
+    dst[j] = '\0';
+}
+
 int jira_search_issues(const char *token, const char *base_url, const char *jql, int limit, jira_issue_t *out_issues, size_t *out_count) {
-    (void)limit;
-    if (!token || !base_url || !jql || !out_issues || !out_count) return -1;
-    
+    if (!token || !base_url || !out_issues || !out_count) return -1;
     *out_count = 0;
+    if (limit <= 0) limit = 10;
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    const char *jql_val = (jql && jql[0]) ? jql : "order by created DESC";
+    char *jql_esc = curl_easy_escape(curl, jql_val, 0);
+    char url[1024];
+    if (jql_esc) {
+        snprintf(url, sizeof(url), "%s/rest/api/3/search?jql=%s&maxResults=%d", base_url, jql_esc, limit);
+        curl_free(jql_esc);
+    } else {
+        snprintf(url, sizeof(url), "%s/rest/api/3/search?maxResults=%d", base_url, limit);
+    }
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    char auth[320];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+    headers = curl_slist_append(headers, auth);
+    curl_response_t rsp = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rsp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK || !rsp.data) {
+        free(rsp.data);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return -1;
+    }
+    const char *issues_start = strstr(rsp.data, "\"issues\":");
+    if (issues_start) {
+        issues_start = strchr(issues_start, '[');
+        if (issues_start) {
+            const char *cur = issues_start + 1;
+            while (*cur && *out_count < (size_t)limit) {
+                const char *key_start = strstr(cur, "\"key\":\"");
+                if (!key_start || key_start > strchr(cur, '}')) break;
+                key_start += 7;
+                size_t k = 0;
+                while (key_start[k] && key_start[k] != '"' && k < sizeof(out_issues[*out_count].key) - 1) {
+                    out_issues[*out_count].key[k] = key_start[k];
+                    k++;
+                }
+                out_issues[*out_count].key[k] = '\0';
+                const char *sum = strstr(cur, "\"summary\":\"");
+                if (sum) {
+                    sum += 10;
+                    k = 0;
+                    while (sum[k] && sum[k] != '"' && k < sizeof(out_issues[*out_count].summary) - 1) {
+                        out_issues[*out_count].summary[k] = sum[k];
+                        k++;
+                    }
+                    out_issues[*out_count].summary[k] = '\0';
+                }
+                (*out_count)++;
+                cur = strchr(cur, '}');
+                if (!cur) break;
+                cur++;
+                if (*cur == ',') cur++;
+            }
+        }
+    }
+    free(rsp.data);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
     return 0;
 }
 
 int jira_create_issue(const char *token, const char *base_url, const char *project, const char *summary, const char *description, char *out_key, size_t key_size) {
-    (void)description;
     if (!token || !base_url || !project || !summary || !out_key) return -1;
-    
-    snprintf(out_key, key_size, "%s-001", project);
-    return 0;
+    char url[512];
+    snprintf(url, sizeof(url), "%s/rest/api/3/issue", base_url);
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+    char auth[320];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+    headers = curl_slist_append(headers, auth);
+    char sum_esc[512], desc_esc[1024];
+    json_escape_str(summary, sum_esc, sizeof(sum_esc));
+    json_escape_str(description ? description : "", desc_esc, sizeof(desc_esc));
+    char body[2048];
+    snprintf(body, sizeof(body),
+             "{\"fields\":{\"project\":{\"key\":\"%s\"},\"summary\":\"%s\",\"description\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":{\"content\":\"%s\"}}]}]}}}",
+             project, sum_esc, desc_esc);
+    curl_response_t rsp = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rsp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK && rsp.data && parse_json_string(rsp.data, "key", out_key, key_size) == 0) {
+        free(rsp.data);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return 0;
+    }
+    if (rsp.data) {
+        snprintf(out_key, key_size, "error");
+    }
+    free(rsp.data);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return -1;
 }
 
 int jira_transition_issue(const char *token, const char *base_url, const char *issue_key, const char *transition_id) {
@@ -450,16 +578,12 @@ int notion_create_page(const char *token, const char *parent_id, const char *tit
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     
     CURLcode res = curl_easy_perform(curl);
-    
-    if (res == CURLE_OK) {
-        snprintf(out_id, id_size, "page-created");
-    } else {
-        snprintf(out_id, id_size, "failed");
+    int ok = 0;
+    if (res == CURLE_OK && rsp.data && parse_json_string(rsp.data, "id", out_id, id_size) == 0) {
+        ok = 1;
     }
-    
     free(rsp.data);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    
-    return 0;
+    return ok ? 0 : -1;
 }

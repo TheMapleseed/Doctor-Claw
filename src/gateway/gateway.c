@@ -1,7 +1,10 @@
 #include "config.h"
 #include "channels.h"
 #include "gateway.h"
+#include "jobcache.h"
 #include "agent.h"
+#include "observability.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +14,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #define MAX_REQUEST_SIZE 65536
 #define MAX_RESPONSE_SIZE 65536
@@ -187,10 +191,142 @@ static int parse_json_prompt(const char *body, char *prompt, size_t prompt_size)
     return 0;
 }
 
-static void handle_request(const http_request_t *req, gateway_response_t *resp, config_t *config) {
+/** Parse Slack URL verification challenge: body has "type":"url_verification" and "challenge":"..." */
+static int parse_slack_challenge(const char *body, char *out_challenge, size_t out_size) {
+    if (!body || !out_challenge || out_size == 0) return -1;
+    if (strstr(body, "\"type\":\"url_verification\"") == NULL && strstr(body, "\"type\": \"url_verification\"") == NULL)
+        return -1;
+    const char *p = strstr(body, "\"challenge\":\"");
+    if (!p) return -1;
+    p += 13;
+    size_t i = 0;
+    while (p[i] && p[i] != '"' && i < out_size - 1) {
+        out_challenge[i] = p[i];
+        i++;
+    }
+    out_challenge[i] = '\0';
+    return 0;
+}
+
+/** Extract message text from webhook body (Telegram/Discord/Slack). Tries "text", "content", "message", then "message":{"text": */
+static int parse_json_webhook_message(const char *body, char *message, size_t message_size) {
+    if (!body || !message || message_size == 0) return -1;
+    message[0] = '\0';
+    const char *keys[] = { "\"text\":\"", "\"content\":\"", "\"message\":\"", "\"message\":{\"text\":\"" };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        const char *p = strstr(body, keys[k]);
+        if (!p) continue;
+        p += strlen(keys[k]);
+        size_t i = 0;
+        while (*p && i + 1 < message_size) {
+            if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) { p++; if (i + 1 < message_size) message[i++] = *p++; continue; }
+            if (*p == '"') break;
+            message[i++] = *p++;
+        }
+        message[i] = '\0';
+        if (i > 0) return 0;
+    }
+    return -1;
+}
+
+typedef struct {
+    int client_fd;
+    config_t *config;
+    jobcache_t *jobcache;
+} gateway_client_ctx_t;
+
+static void handle_request(const http_request_t *req, gateway_response_t *resp, config_t *config, jobcache_t *jobcache);
+
+static void *gateway_worker(void *arg) {
+    gateway_client_ctx_t *ctx = (gateway_client_ctx_t *)arg;
+    int client_fd = ctx->client_fd;
+    config_t *config = ctx->config;
+    free(ctx);
+    pthread_detach(pthread_self());
+
+    char buffer[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
+    ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0) {
+        close(client_fd);
+        return NULL;
+    }
+    buffer[n] = '\0';
+
+    http_request_t req;
+    parse_http_request(buffer, (size_t)n, &req);
+
+    const char *upgrade = get_header(&req, "Upgrade");
+    if (upgrade && strcmp(upgrade, "websocket") == 0) {
+        handle_ws_request(&req, client_fd);
+        bool running = true;
+        while (running) {
+            ssize_t ws_n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+            if (ws_n <= 0) break;
+            char decoded[WS_MAX_MESSAGE_SIZE];
+            size_t decoded_len = 0;
+            bool binary = false;
+            ws_parse_frame(buffer, (size_t)ws_n, decoded, &decoded_len, &binary);
+            if ((uint8_t)buffer[0] == 0x8) running = false;
+            if (decoded_len > 0) {
+                char response[WS_MAX_MESSAGE_SIZE];
+                snprintf(response, sizeof(response), "Echo: %s", decoded);
+                ws_send_to_fd(client_fd, response, strlen(response), false);
+            }
+        }
+    } else {
+        gateway_response_t resp;
+        handle_request(&req, &resp, config, ctx->jobcache);
+        char response_buf[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
+        size_t resp_size = sizeof(response_buf);
+        build_http_response(&resp, response_buf, &resp_size);
+        send(client_fd, response_buf, resp_size, 0);
+    }
+    close(client_fd);
+    return NULL;
+}
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    char buffer[16384];
+    int done;
+} agent_sync_ctx_t;
+
+static void agent_response_cb(void *ctx, const char *result, size_t len, int error) {
+    agent_sync_ctx_t *s = (agent_sync_ctx_t *)ctx;
+    pthread_mutex_lock(&s->mutex);
+    if (len >= sizeof(s->buffer)) len = sizeof(s->buffer) - 1;
+    memcpy(s->buffer, result, len);
+    s->buffer[len] = '\0';
+    if (error != 0 && s->buffer[0] == '\0')
+        snprintf(s->buffer, sizeof(s->buffer), "error=%d", error);
+    s->done = 1;
+    pthread_cond_signal(&s->cond);
+    pthread_mutex_unlock(&s->mutex);
+}
+
+static void handle_request(const http_request_t *req, gateway_response_t *resp, config_t *config, jobcache_t *jobcache) {
     memset(resp, 0, sizeof(gateway_response_t));
-    
-    if (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index.html") == 0) {
+    observability_record_global("http_requests_total", 1.0);
+
+    if (strcmp(req->path, "/metrics") == 0) {
+        char buf[8192];
+        size_t len = sizeof(buf);
+        if (observability_prometheus_export(observability_global_get(), buf, len) == 0) {
+            resp->status_code = 200;
+            snprintf(resp->status_text, sizeof(resp->status_text), "OK");
+            snprintf(resp->content_type, sizeof(resp->content_type), "text/plain; version=0.0.4");
+            size_t n = strlen(buf);
+            if (n >= sizeof(resp->body)) n = sizeof(resp->body) - 1;
+            memcpy(resp->body, buf, n);
+            resp->body[n] = '\0';
+            resp->body_size = n;
+        } else {
+            resp->status_code = 500;
+            snprintf(resp->body, sizeof(resp->body), "metrics error");
+            resp->body_size = strlen(resp->body);
+        }
+    } else if (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index.html") == 0) {
         resp->status_code = 200;
         snprintf(resp->status_text, sizeof(resp->status_text), "OK");
         snprintf(resp->content_type, sizeof(resp->content_type), "text/html");
@@ -209,19 +345,77 @@ static void handle_request(const http_request_t *req, gateway_response_t *resp, 
         snprintf(resp->body, sizeof(resp->body), 
                  "{\"message\":\"Webhook endpoint ready\",\"paths\":[\"/telegram\",\"/discord\",\"/slack\"]}");
         resp->body_size = strlen(resp->body);
-    } else if (strncmp(req->path, "/telegram", 9) == 0) {
+    } else if (strncmp(req->path, "/telegram", 9) == 0 || strncmp(req->path, "/discord", 8) == 0 || strncmp(req->path, "/slack", 6) == 0) {
         resp->status_code = 200;
         snprintf(resp->status_text, sizeof(resp->status_text), "OK");
         snprintf(resp->content_type, sizeof(resp->content_type), "application/json");
-        
-        char message[MAX_MESSAGE_CONTENT] = {0};
-        if (sscanf(req->body, "{\"message\":{\"text\":\"%2047[^\"]\"}}", message) == 1) {
-            snprintf(resp->body, sizeof(resp->body), 
-                     "{\"status\":\"received\",\"message\":\"%s\"}", message);
-        } else {
-            snprintf(resp->body, sizeof(resp->body), "{\"status\":\"ok\"}");
+        /* Slack URL verification (Events API) */
+        if (strncmp(req->path, "/slack", 6) == 0) {
+            char challenge[512];
+            if (parse_slack_challenge(req->body, challenge, sizeof(challenge)) == 0) {
+                snprintf(resp->body, sizeof(resp->body), "{\"challenge\":\"%s\"}", challenge);
+                resp->body_size = strlen(resp->body);
+            }
         }
-        resp->body_size = strlen(resp->body);
+        if (resp->body_size == 0) {
+            char webhook_msg[4096] = {0};
+            if (parse_json_webhook_message(req->body, webhook_msg, sizeof(webhook_msg)) != 0 || !webhook_msg[0]) {
+                snprintf(resp->body, sizeof(resp->body), "{\"error\":\"No message in body\"}");
+                resp->body_size = strlen(resp->body);
+            } else {
+                if (jobcache) {
+                    agent_sync_ctx_t sync_ctx = {0};
+                    pthread_mutex_init(&sync_ctx.mutex, NULL);
+                    pthread_cond_init(&sync_ctx.cond, NULL);
+                    job_t job = {0};
+                    job.type = JOB_AGENT_CHAT;
+                    snprintf(job.instance_id, sizeof(job.instance_id), "default");
+                    job.payload_len = strlen(webhook_msg);
+                    if (job.payload_len >= sizeof(job.payload)) job.payload_len = sizeof(job.payload) - 1;
+                    memcpy(job.payload, webhook_msg, job.payload_len);
+                    job.payload[job.payload_len] = '\0';
+                    job.response_cb = agent_response_cb;
+                    job.response_ctx = &sync_ctx;
+                    if (jobcache_push(jobcache, &job) == 0) {
+                        pthread_mutex_lock(&sync_ctx.mutex);
+                        while (!sync_ctx.done)
+                            pthread_cond_wait(&sync_ctx.cond, &sync_ctx.mutex);
+                        pthread_mutex_unlock(&sync_ctx.mutex);
+                        if (sync_ctx.buffer[0]) {
+                            channels_reply_to_webhook(req->path, req->body, sync_ctx.buffer);
+                            char escaped[32768];
+                            json_escape(sync_ctx.buffer, escaped, sizeof(escaped));
+                            snprintf(resp->body, sizeof(resp->body), "{\"response\":\"%s\"}", escaped);
+                        } else {
+                            snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Agent failed\"}");
+                        }
+                    } else {
+                        snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Job queue full\"}");
+                    }
+                    resp->body_size = strlen(resp->body);
+                    pthread_cond_destroy(&sync_ctx.cond);
+                    pthread_mutex_destroy(&sync_ctx.mutex);
+                } else {
+                    agent_t agent = {0};
+                    if (config && agent_init(&agent, config) == 0) {
+                        char response_buf[16384] = {0};
+                        int chat_ret = agent_chat(&agent, webhook_msg, response_buf, sizeof(response_buf));
+                        agent_free(&agent);
+                        if (chat_ret == 0 && response_buf[0]) {
+                            channels_reply_to_webhook(req->path, req->body, response_buf);
+                            char escaped[32768];
+                            json_escape(response_buf, escaped, sizeof(escaped));
+                            snprintf(resp->body, sizeof(resp->body), "{\"response\":\"%s\"}", escaped);
+                        } else {
+                            snprintf(resp->body, sizeof(resp->body), "{\"error\":\"%s\"}", response_buf[0] ? response_buf : "Agent failed");
+                        }
+                    } else {
+                        snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Agent init failed\"}");
+                    }
+                    resp->body_size = strlen(resp->body);
+                }
+            }
+        }
     } else if (strcmp(req->path, "/agent/chat") == 0 && (req->method[0] == 'P' || req->method[0] == 'p')) {
         resp->status_code = 200;
         snprintf(resp->status_text, sizeof(resp->status_text), "OK");
@@ -234,25 +428,63 @@ static void handle_request(const http_request_t *req, gateway_response_t *resp, 
         } else {
             bool task_focus = (strstr(req->body, "\"task_focus\":true") != NULL ||
                               strstr(req->body, "\"task_focus\": true") != NULL);
-            agent_t agent = {0};
-            if (config && agent_init(&agent, config) == 0) {
-                char response_buf[16384] = {0};
-                int chat_ret = task_focus
-                    ? agent_run_task(&agent, prompt, response_buf, sizeof(response_buf))
-                    : agent_chat(&agent, prompt, response_buf, sizeof(response_buf));
-                agent_free(&agent);
-                if (chat_ret == 0 && response_buf[0]) {
-                    char escaped[32768];
-                    json_escape(response_buf, escaped, sizeof(escaped));
-                    snprintf(resp->body, sizeof(resp->body), "{\"response\":\"%s\"}", escaped);
+            if (jobcache) {
+                agent_sync_ctx_t sync_ctx = {0};
+                pthread_mutex_init(&sync_ctx.mutex, NULL);
+                pthread_cond_init(&sync_ctx.cond, NULL);
+                job_t job = {0};
+                job.type = JOB_AGENT_CHAT;
+                snprintf(job.instance_id, sizeof(job.instance_id), "default");
+                if (task_focus) {
+                    size_t pre = (size_t)snprintf(job.payload, sizeof(job.payload), "task_focus=1\n%s", prompt);
+                    job.payload_len = pre < sizeof(job.payload) ? pre : sizeof(job.payload) - 1;
                 } else {
-                    snprintf(resp->body, sizeof(resp->body), "{\"error\":\"%s\"}",
-                             response_buf[0] ? response_buf : "Agent chat failed");
+                    job.payload_len = strlen(prompt);
+                    if (job.payload_len >= sizeof(job.payload)) job.payload_len = sizeof(job.payload) - 1;
+                    memcpy(job.payload, prompt, job.payload_len);
+                    job.payload[job.payload_len] = '\0';
                 }
+                job.response_cb = agent_response_cb;
+                job.response_ctx = &sync_ctx;
+                if (jobcache_push(jobcache, &job) == 0) {
+                    pthread_mutex_lock(&sync_ctx.mutex);
+                    while (!sync_ctx.done)
+                        pthread_cond_wait(&sync_ctx.cond, &sync_ctx.mutex);
+                    pthread_mutex_unlock(&sync_ctx.mutex);
+                    if (sync_ctx.buffer[0]) {
+                        char escaped[32768];
+                        json_escape(sync_ctx.buffer, escaped, sizeof(escaped));
+                        snprintf(resp->body, sizeof(resp->body), "{\"response\":\"%s\"}", escaped);
+                    } else {
+                        snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Agent failed\"}");
+                    }
+                } else {
+                    snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Job queue full\"}");
+                }
+                resp->body_size = strlen(resp->body);
+                pthread_cond_destroy(&sync_ctx.cond);
+                pthread_mutex_destroy(&sync_ctx.mutex);
             } else {
-                snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Agent init failed\"}");
+                agent_t agent = {0};
+                if (config && agent_init(&agent, config) == 0) {
+                    char response_buf[16384] = {0};
+                    int chat_ret = task_focus
+                        ? agent_run_task(&agent, prompt, response_buf, sizeof(response_buf))
+                        : agent_chat(&agent, prompt, response_buf, sizeof(response_buf));
+                    agent_free(&agent);
+                    if (chat_ret == 0 && response_buf[0]) {
+                        char escaped[32768];
+                        json_escape(response_buf, escaped, sizeof(escaped));
+                        snprintf(resp->body, sizeof(resp->body), "{\"response\":\"%s\"}", escaped);
+                    } else {
+                        snprintf(resp->body, sizeof(resp->body), "{\"error\":\"%s\"}",
+                                 response_buf[0] ? response_buf : "Agent chat failed");
+                    }
+                } else {
+                    snprintf(resp->body, sizeof(resp->body), "{\"error\":\"Agent init failed\"}");
+                }
+                resp->body_size = strlen(resp->body);
             }
-            resp->body_size = strlen(resp->body);
         }
     } else {
         resp->status_code = 404;
@@ -263,7 +495,12 @@ static void handle_request(const http_request_t *req, gateway_response_t *resp, 
     }
 }
 
-int gateway_run(const char *host, uint16_t port, config_t *config) {
+int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcache *jobcache) {
+    if (config && config->paths.workspace_dir[0]) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/channels/config.toml", config->paths.workspace_dir);
+        (void)channels_load_config(path);
+    }
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         perror("socket");
@@ -295,73 +532,34 @@ int gateway_run(const char *host, uint16_t port, config_t *config) {
         return -1;
     }
     
-    printf("[Gateway] Listening on http://%s:%d\n", host, port);
-    
+    log_info("Gateway listening on http://%s:%d (multi-threaded)", host, port);
+
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &client_len);
-        
+
         if (client_fd < 0) {
             perror("accept");
             continue;
         }
-        
-        char buffer[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
-        ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-        
-        if (n > 0) {
-            buffer[n] = '\0';
-            
-            http_request_t req;
-            parse_http_request(buffer, n, &req);
-            
-            const char *upgrade = get_header(&req, "Upgrade");
-            if (upgrade && strcmp(upgrade, "websocket") == 0) {
-                printf("[Gateway] Handling WebSocket upgrade\n");
-                handle_ws_request(&req, client_fd);
-                
-                bool running = true;
-                
-                while (running) {
-                    ssize_t ws_n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-                    if (ws_n <= 0) break;
-                    
-                    char decoded[WS_MAX_MESSAGE_SIZE];
-                    size_t decoded_len = 0;
-                    bool binary = false;
-                    
-                    ws_parse_frame(buffer, (size_t)ws_n, decoded, &decoded_len, &binary);
-                    
-                    if ((uint8_t)buffer[0] == 0x8) {
-                        running = false;
-                    }
-                    
-                    if (decoded_len > 0) {
-                        printf("[Gateway] WS received: %s\n", decoded);
-                        char response[WS_MAX_MESSAGE_SIZE];
-                        snprintf(response, sizeof(response), "Echo: %s", decoded);
-                        ws_send_to_fd(client_fd, response, strlen(response), false);
-                    }
-                }
-                
-                close(client_fd);
-                continue;
-            }
-            
-            gateway_response_t resp;
-            handle_request(&req, &resp, config);
-            
-            char response_buf[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
-            size_t resp_size = sizeof(response_buf);
-            build_http_response(&resp, response_buf, &resp_size);
-            
-            send(client_fd, response_buf, resp_size, 0);
+
+        gateway_client_ctx_t *ctx = (gateway_client_ctx_t *)malloc(sizeof(gateway_client_ctx_t));
+        if (!ctx) {
+            close(client_fd);
+            continue;
         }
-        
-        close(client_fd);
+        ctx->client_fd = client_fd;
+        ctx->config = config;
+        ctx->jobcache = jobcache;
+
+        pthread_t th;
+        if (pthread_create(&th, NULL, gateway_worker, ctx) != 0) {
+            free(ctx);
+            close(client_fd);
+        }
     }
-    
+
     close(sockfd);
     return 0;
 }

@@ -2,6 +2,7 @@
 #include "providers.h"
 #include "memory.h"
 #include "tools.h"
+#include "rag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -356,6 +357,9 @@ int agent_init(agent_t *agent, const config_t *config) {
     if (!agent || !config) return -1;
     
     memset(agent, 0, sizeof(agent_t));
+    tools_set_workspace(config->paths.workspace_dir);
+    strncpy(agent->workspace_dir, config->paths.workspace_dir, sizeof(agent->workspace_dir) - 1);
+    agent->workspace_dir[sizeof(agent->workspace_dir) - 1] = '\0';
     
     snprintf(agent->name, sizeof(agent->name), "DoctorClaw");
     snprintf(agent->description, sizeof(agent->description), "Autonomous AI assistant");
@@ -759,6 +763,31 @@ int agent_start(agent_t *agent, const char *message) {
 int agent_chat(agent_t *agent, const char *message, char *response, size_t response_size) {
     if (!agent || !message || !response || response_size == 0) return -1;
     agent->state = AGENT_STATE_THINKING;
+    char augmented_message[8192];
+    size_t aug_len = 0;
+    if (agent->workspace_dir[0]) {
+        char rag_path[512];
+        snprintf(rag_path, sizeof(rag_path), "%s/rag.idx", agent->workspace_dir);
+        rag_index_t rag = {0};
+        if (rag_index_load(&rag, rag_path) == 0) {
+            rag_result_t rag_result = {0};
+            if (rag_index_query(&rag, message, 5, &rag_result) == 0 && rag_result.chunk_count > 0) {
+                aug_len = (size_t)snprintf(augmented_message, sizeof(augmented_message), "Relevant context from RAG:\n");
+                for (size_t i = 0; i < rag_result.chunk_count && aug_len < sizeof(augmented_message) - 256; i++) {
+                    aug_len += (size_t)snprintf(augmented_message + aug_len, sizeof(augmented_message) - aug_len,
+                        "[%zu] %s\n", i + 1, rag_result.chunks[i]);
+                }
+                aug_len += (size_t)snprintf(augmented_message + aug_len, sizeof(augmented_message) - aug_len, "\nUser: %s", message);
+                rag_index_free(&rag);
+                int r = agent_think_with_tools(agent, augmented_message, response, response_size);
+                agent->state = AGENT_STATE_IDLE;
+                return r;
+            }
+            rag_index_free(&rag);
+        }
+    }
+    aug_len = 0;
+    (void)aug_len;
     int r = agent_think_with_tools(agent, message, response, response_size);
     agent->state = AGENT_STATE_IDLE;
     return r;
