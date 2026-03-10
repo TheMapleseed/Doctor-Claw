@@ -27,7 +27,7 @@
 
 static const char *SAFE_ENV_VARS[] = {
     "HOME", "USER", "PATH", "PWD", "SHELL", "TERM", "LANG", "LC_ALL",
-    "TMPDIR", "TZ", "DISPLAY", "XAUTHORITY", NULL
+    "TMPDIR", "TZ", "DISPLAY", "XAUTHORITY", "DOCTORCLAW_SHELL", NULL
 };
 
 #define MAX_FILE_SIZE (10 * 1024 * 1024)
@@ -53,7 +53,7 @@ static int setup_secure_env(void);
 static int canonicalize_path(const char *path, char *resolved, size_t max_len);
 static int is_path_in_workspace(const char *path);
 static int check_dangerous_command(const char *command);
-static int run_with_timeout(const char *command, char *output, size_t output_size, int timeout_secs);
+static int run_with_timeout(const char *command, char *output, size_t output_size, int timeout_secs, const char *shell_override);
 static int check_shell_policy(const char *command);
 
 int tools_init(void) {
@@ -109,6 +109,12 @@ int tools_execute(const char *tool_name, const char *params, tool_result_t *resu
     if (strcmp(tool_name, "shell") == 0 || strcmp(tool_name, "bash") == 0 || strcmp(tool_name, "cmd") == 0) {
         if (check_approval_risky("shell", result) != 0) { /* result already filled */ }
         else result->success = (tool_shell_execute(params, result) == 0);
+    } else if (strcmp(tool_name, "zsh") == 0) {
+        if (check_approval_risky("zsh", result) != 0) { /* result already filled */ }
+        else result->success = (tool_zsh_execute(params, result) == 0);
+    } else if (strcmp(tool_name, "network") == 0) {
+        if (check_approval_risky("network", result) != 0) { /* result already filled */ }
+        else result->success = (tool_network_execute(params, result) == 0);
     } else if (strcmp(tool_name, "read") == 0 || strcmp(tool_name, "file_read") == 0) {
         result->success = (tool_file_read_execute(params, result) == 0);
     } else if (strcmp(tool_name, "write") == 0 || strcmp(tool_name, "file_write") == 0) {
@@ -215,6 +221,8 @@ void tools_list(tool_spec_t **out_tools, size_t *out_count) {
     static tool_spec_t builtin_tools[] = {
         {"shell", "Execute shell commands", "{\"command\": \"string\"}", false},
         {"bash", "Execute bash shell commands", "{\"command\": \"string\"}", false},
+        {"zsh", "Execute command in zsh (arrays, globs, etc.; set DOCTORCLAW_SHELL=/bin/zsh for default shell)", "{\"command\": \"string\"}", false},
+        {"network", "Run command with direct network stack access (e.g. ip addr, nc, ping, ifconfig)", "{\"command\": \"string\"}", false},
         {"read", "Read file contents", "{\"path\": \"string\"}", false},
         {"write", "Write file contents", "{\"path\": \"string\", \"content\": \"string\"}", false},
         {"glob", "Find files matching pattern", "{\"pattern\": \"string\", \"path\": \"string\"}", false},
@@ -450,7 +458,10 @@ static int setup_secure_env(void) {
     
     setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/snap/bin", 1);
     setenv("HOME", "/tmp/doctorclaw_home", 1);
-    setenv("SHELL", "/bin/sh", 1);
+    {
+        const char *prefer = getenv("DOCTORCLAW_SHELL");
+        setenv("SHELL", (prefer && prefer[0]) ? prefer : "/bin/sh", 1);
+    }
     
     return 0;
 }
@@ -464,9 +475,21 @@ static int check_shell_policy(const char *command) {
     return 0;
 }
 
-static int run_with_timeout(const char *command, char *output, size_t output_size, int timeout_secs) {
+/**
+ * Run command with timeout. shell_override: NULL = use DOCTORCLAW_SHELL env or /bin/sh;
+ * e.g. "/bin/zsh" for zsh. Enables direct control of shell and network stack (e.g. zsh, ip, nc).
+ */
+static int run_with_timeout(const char *command, char *output, size_t output_size, int timeout_secs, const char *shell_override) {
     int pipefd[2];
     if (pipe(pipefd) == -1) return -1;
+    
+    const char *shell_path = shell_override;
+    if (!shell_path || !shell_path[0]) {
+        shell_path = getenv("DOCTORCLAW_SHELL");
+        if (!shell_path || !shell_path[0]) shell_path = "/bin/sh";
+    }
+    const char *prog_name = strrchr(shell_path, '/');
+    prog_name = prog_name ? prog_name + 1 : shell_path;
     
     pid_t pid = fork();
     if (pid == -1) {
@@ -483,7 +506,7 @@ static int run_with_timeout(const char *command, char *output, size_t output_siz
         
         setup_secure_env();
         
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        execl(shell_path, prog_name, "-c", command, (char *)NULL);
         _exit(127);
     }
     
@@ -592,7 +615,7 @@ int tool_shell_execute(const char *params, tool_result_t *result) {
     if (timeout <= 0 || timeout > 300) timeout = SHELL_TIMEOUT_SECONDS;
     
     clock_t start = clock();
-    int status = run_with_timeout(command, output, sizeof(output), timeout);
+    int status = run_with_timeout(command, output, sizeof(output), timeout, NULL);
     clock_t end = clock();
     result->execution_time_ms = (uint64_t)((double)(end - start) / CLOCKS_PER_SEC * 1000);
     
@@ -617,6 +640,112 @@ int tool_shell_execute(const char *params, tool_result_t *result) {
         }
     }
     
+    return 0;
+}
+
+/** Run a command in zsh. Use when zsh features (arrays, globs, etc.) or direct network stack control via zsh is needed. */
+int tool_zsh_execute(const char *params, tool_result_t *result) {
+    if (!params || !result) return -1;
+    memset(result, 0, sizeof(tool_result_t));
+    char command[SHELL_MAX_INPUT] = {0};
+    char *cmd = parse_string_param(params, "command");
+    if (cmd) {
+        size_t cmd_len = strlen(cmd);
+        if (cmd_len >= SHELL_MAX_INPUT) {
+            snprintf(result->error, sizeof(result->error), "Command too long (max %d)", SHELL_MAX_INPUT);
+            return -1;
+        }
+        snprintf(command, sizeof(command), "%s", cmd);
+    } else {
+        size_t params_len = strlen(params);
+        if (params_len >= SHELL_MAX_INPUT) {
+            snprintf(result->error, sizeof(result->error), "Command too long (max %d)", SHELL_MAX_INPUT);
+            return -1;
+        }
+        snprintf(command, sizeof(command), "%s", params);
+    }
+    if (strlen(command) == 0) {
+        snprintf(result->error, sizeof(result->error), "No command provided");
+        return -1;
+    }
+    if (check_dangerous_command(command) != 0) {
+        snprintf(result->error, sizeof(result->error), "Command contains dangerous pattern");
+        return -1;
+    }
+    if (check_shell_policy(command) != 0) {
+        snprintf(result->error, sizeof(result->error), "Command blocked by security policy");
+        return -1;
+    }
+    char output[SHELL_MAX_OUTPUT] = {0};
+    int timeout = parse_int_param(params, "timeout", SHELL_TIMEOUT_SECONDS);
+    if (timeout <= 0 || timeout > 300) timeout = SHELL_TIMEOUT_SECONDS;
+    clock_t start = clock();
+    int status = run_with_timeout(command, output, sizeof(output), timeout, "/bin/zsh");
+    clock_t end = clock();
+    result->execution_time_ms = (uint64_t)((double)(end - start) / CLOCKS_PER_SEC * 1000);
+    result->success = (status == 0);
+    if (status == -1 && strstr(output, "[TIMEOUT]") != NULL) result->success = false;
+    if (strlen(output) >= SHELL_MAX_OUTPUT - 10) strcat(output, "\n[OUTPUT TRUNCATED]");
+    snprintf(result->result, sizeof(result->result), "%s", output);
+    if (!result->success && status != -1) {
+        char status_msg[128];
+        snprintf(status_msg, sizeof(status_msg), "\n[Exit code: %d]", status);
+        size_t len = strlen(result->result);
+        if (len + strlen(status_msg) < sizeof(result->result)) strcat(result->result, status_msg);
+    }
+    return 0;
+}
+
+/** Run a command with direct network stack access (e.g. ip addr, nc, ping, ifconfig). Requires approval. */
+int tool_network_execute(const char *params, tool_result_t *result) {
+    if (!params || !result) return -1;
+    memset(result, 0, sizeof(tool_result_t));
+    char command[SHELL_MAX_INPUT] = {0};
+    char *cmd = parse_string_param(params, "command");
+    if (cmd) {
+        size_t cmd_len = strlen(cmd);
+        if (cmd_len >= SHELL_MAX_INPUT) {
+            snprintf(result->error, sizeof(result->error), "Command too long (max %d)", SHELL_MAX_INPUT);
+            return -1;
+        }
+        snprintf(command, sizeof(command), "%s", cmd);
+    } else {
+        size_t params_len = strlen(params);
+        if (params_len >= SHELL_MAX_INPUT) {
+            snprintf(result->error, sizeof(result->error), "Command too long (max %d)", SHELL_MAX_INPUT);
+            return -1;
+        }
+        snprintf(command, sizeof(command), "%s", params);
+    }
+    if (strlen(command) == 0) {
+        snprintf(result->error, sizeof(result->error), "No command provided");
+        return -1;
+    }
+    if (check_dangerous_command(command) != 0) {
+        snprintf(result->error, sizeof(result->error), "Command contains dangerous pattern");
+        return -1;
+    }
+    if (check_shell_policy(command) != 0) {
+        snprintf(result->error, sizeof(result->error), "Command blocked by security policy");
+        return -1;
+    }
+    char output[SHELL_MAX_OUTPUT] = {0};
+    int timeout = parse_int_param(params, "timeout", SHELL_TIMEOUT_SECONDS);
+    if (timeout <= 0 || timeout > 300) timeout = SHELL_TIMEOUT_SECONDS;
+    clock_t start = clock();
+    int status = run_with_timeout(command, output, sizeof(output), timeout, NULL);
+    clock_t end = clock();
+    result->execution_time_ms = (uint64_t)((double)(end - start) / CLOCKS_PER_SEC * 1000);
+    result->success = (status == 0);
+    if (status == -1 && strstr(output, "[TIMEOUT]") != NULL) result->success = false;
+    if (strlen(output) >= SHELL_MAX_OUTPUT - 10) strcat(output, "\n[OUTPUT TRUNCATED]");
+    snprintf(result->result, sizeof(result->result), "%s", output);
+    if (!result->success && status != -1) {
+        char status_msg[128];
+        snprintf(status_msg, sizeof(status_msg), "\n[Exit code: %d]", status);
+        size_t len = strlen(result->result);
+        if (len + strlen(status_msg) < sizeof(result->result)) strcat(result->result, status_msg);
+    }
     return 0;
 }
 

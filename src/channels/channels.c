@@ -949,6 +949,24 @@ int channels_reply_to_webhook(const char *path, const char *body, const char *re
     return -1;
 }
 
+int channels_send_alert(const char *message) {
+    if (!message || !message[0]) return -1;
+    int sent = 0;
+    for (size_t i = 0; i < g_channel_count; i++) {
+        if (!g_channels[i].config.enabled) continue;
+        const channel_config_t *c = &g_channels[i].config;
+        if (c->type == CHANNEL_TELEGRAM && c->bot_token[0]) {
+            const char *chat_id = (c->allowed_users[0] && c->allowed_users[0][0]) ? c->allowed_users[0] : NULL;
+            if (telegram_send_message_to(c, chat_id, message) == 0) sent++;
+        } else if (c->type == CHANNEL_DISCORD && c->webhook_url[0]) {
+            if (discord_send_message(c, message) == 0) sent++;
+        } else if (c->type == CHANNEL_SLACK && c->bot_token[0]) {
+            if (slack_send_message(c, message) == 0) sent++;
+        }
+    }
+    return sent > 0 ? 0 : -1;
+}
+
 /** Reply context for agent result -> send back to channel (used by poll thread + job worker). */
 typedef struct {
     size_t channel_index;

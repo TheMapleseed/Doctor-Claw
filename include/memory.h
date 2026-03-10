@@ -17,6 +17,7 @@ typedef enum {
     MEMORY_BACKEND_LUCID,
     MEMORY_BACKEND_MARKDOWN,
     MEMORY_BACKEND_POSTGRES,
+    MEMORY_BACKEND_MUNINN,
     MEMORY_BACKEND_NONE,
     MEMORY_BACKEND_UNKNOWN
 } memory_backend_t;
@@ -129,6 +130,11 @@ int memory_lucid_store(memory_t *mem, const memory_item_t *item);
 int memory_lucid_recall(memory_t *mem, const char *key, memory_item_t *out_item);
 int memory_lucid_search(memory_t *mem, const char *query, memory_item_t **results, size_t *count);
 void memory_lucid_free(memory_t *mem);
+
+int memory_muninn_init(memory_t *mem, const char *storage_path);
+int memory_muninn_store(memory_t *mem, const memory_item_t *item);
+int memory_muninn_recall(memory_t *mem, const char *key, memory_item_t *out_item);
+void memory_muninn_free(memory_t *mem);
 
 int memory_none_init(memory_t *mem);
 int memory_none_store(memory_t *mem, const memory_item_t *item);

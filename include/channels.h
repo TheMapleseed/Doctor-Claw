@@ -80,6 +80,9 @@ bool channel_is_user_allowed(channel_t *ch, const char *user_id);
 /** Reply to an incoming webhook (parse path+body, send response_text to the channel). */
 int channels_reply_to_webhook(const char *path, const char *body, const char *response_text);
 
+/** Send an alert message to the user on all enabled channels (e.g. security/runtime alerts). */
+int channels_send_alert(const char *message);
+
 /** Start background listeners (e.g. Telegram getUpdates). jobcache is jobcache_t* for enqueue. */
 int channel_start_listeners(const char *config_path, void *jobcache);
 /** Stop listeners. */

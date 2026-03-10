@@ -199,7 +199,9 @@ int migration_execute(migration_manager_t *mgr, const char *name) {
     
     if (!mig) return -1;
 
-    if (mig->source == MIGRATION_SOURCE_GENERIC) {
+    /* Generic or Ollama/Claude/OpenAI JSON export: same key-value import. */
+    if (mig->source == MIGRATION_SOURCE_GENERIC || mig->source == MIGRATION_SOURCE_OLLAMA
+        || mig->source == MIGRATION_SOURCE_CLAUDE || mig->source == MIGRATION_SOURCE_OPENAI) {
         size_t len = strlen(mig->source_path);
         if (len >= 5 && strcmp(mig->source_path + len - 5, ".json") == 0) {
             mig->state = MIGRATION_STATE_SCANNING;

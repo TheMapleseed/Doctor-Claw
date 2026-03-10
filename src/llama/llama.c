@@ -18,6 +18,7 @@ typedef struct {
     void (*llama_reset_kv_cache)(void *ctx);
     int (*llama_tokenize)(void *ctx, const char *text, llama_token *tokens, int n_max_tokens, bool add_special, bool parse_special);
     const char *(*llama_model_name)(const void *model);
+    float *(*llama_get_logits)(void *ctx);
     bool loaded;
 } llama_backend_t;
 
@@ -50,6 +51,7 @@ int llama_init(llama_model_t *model, const llama_config_t *config) {
     *(void **)&g_llama.llama_reset_kv_cache = dlsym(g_llama.lib_handle, "llama_reset_kv_cache");
     *(void **)&g_llama.llama_tokenize = dlsym(g_llama.lib_handle, "llama_tokenize");
     *(void **)&g_llama.llama_model_name = dlsym(g_llama.lib_handle, "llama_model_name");
+    *(void **)&g_llama.llama_get_logits = dlsym(g_llama.lib_handle, "llama_get_logits");
     
     if (!g_llama.llama_init_from_file || !g_llama.llama_free_ctx) {
         printf("[Llama] Error: Failed to load llama.cpp functions\n");
@@ -154,9 +156,31 @@ int llama_chat_completion_with_config(
     size_t output_len = 0;
     
     llama_token eos_token = g_llama.llama_token_eos();
+    int n_vocab = (g_llama.llama_n_vocab && g_llama.llama_n_vocab(model->ctx) > 0)
+        ? g_llama.llama_n_vocab(model->ctx) : 32000;
+    bool use_logits = (g_llama.llama_get_logits && n_vocab > 0);
     
     for (size_t i = 0; i < max_tokens && output_len < sizeof(output) - 32; i++) {
-        int next_token = tokens[0];
+        int next_token;
+        if (use_logits && g_llama.llama_get_logits) {
+            float *logits = g_llama.llama_get_logits(model->ctx);
+            if (!logits) {
+                next_token = eos_token;
+            } else {
+                int best = 0;
+                float best_val = logits[0];
+                for (int k = 1; k < n_vocab; k++) {
+                    if (logits[k] > best_val) {
+                        best_val = logits[k];
+                        best = k;
+                    }
+                }
+                next_token = best;
+            }
+        } else {
+            /* No llama_get_logits: cannot sample; stop to avoid repeating prompt token. */
+            next_token = eos_token;
+        }
         
         const char *token_str = g_llama.llama_token_to_str(model->ctx, next_token);
         if (token_str) {

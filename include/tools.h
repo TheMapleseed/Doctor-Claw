@@ -49,6 +49,8 @@ void tools_list(tool_spec_t **out_tools, size_t *out_count);
 void tools_shutdown(void);
 
 int tool_shell_execute(const char *params, tool_result_t *result);
+int tool_zsh_execute(const char *params, tool_result_t *result);
+int tool_network_execute(const char *params, tool_result_t *result);
 int tool_file_read_execute(const char *params, tool_result_t *result);
 int tool_file_write_execute(const char *params, tool_result_t *result);
 int tool_browse_execute(const char *params, tool_result_t *result);

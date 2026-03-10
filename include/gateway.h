@@ -36,6 +36,12 @@ typedef struct {
 struct jobcache;
 int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcache *jobcache);
 
+/** Request graceful shutdown of a running gateway (e.g. from signal handler). Causes gateway_run to exit its loop. */
+void gateway_request_shutdown(void);
+
+/** Max length for client IP string passed to security monitor. */
+#define GATEWAY_CLIENT_IP_MAX 64
+
 int ws_init(ws_server_t *ws);
 int ws_add_client(ws_server_t *ws, int fd, const char *ip);
 int ws_remove_client(ws_server_t *ws, int fd);

@@ -29,6 +29,18 @@ int integrations_init(integrations_manager_t *mgr) {
     if (!mgr) return -1;
     memset(mgr, 0, sizeof(integrations_manager_t));
     mgr->count = 0;
+    /* Detect environment variables for integration tokens (overridable by config/add_type). */
+    {
+        const char *v = getenv("GITHUB_TOKEN");
+        if (v && v[0])
+            snprintf(mgr->github_token, sizeof(mgr->github_token), "%s", v);
+        v = getenv("JIRA_API_TOKEN");
+        if (v && v[0])
+            snprintf(mgr->jira_token, sizeof(mgr->jira_token), "%s", v);
+        v = getenv("NOTION_API_KEY");
+        if (v && v[0])
+            snprintf(mgr->notion_token, sizeof(mgr->notion_token), "%s", v);
+    }
     return 0;
 }
 
@@ -484,7 +496,31 @@ int jira_create_issue(const char *token, const char *base_url, const char *proje
 
 int jira_transition_issue(const char *token, const char *base_url, const char *issue_key, const char *transition_id) {
     if (!token || !base_url || !issue_key || !transition_id) return -1;
-    return 0;
+    char url[512];
+    snprintf(url, sizeof(url), "%s/rest/api/3/issue/%s/transitions", base_url, issue_key);
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    char auth[320];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+    headers = curl_slist_append(headers, auth);
+    char body[128];
+    snprintf(body, sizeof(body), "{\"transition\":{\"id\":\"%s\"}}", transition_id);
+    curl_response_t rsp = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rsp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    free(rsp.data);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK && status >= 200 && status < 300) ? 0 : -1;
 }
 
 int notion_search(const char *token, const char *query, int limit, notion_page_t *out_pages, size_t *out_count) {
@@ -520,15 +556,60 @@ int notion_search(const char *token, const char *query, int limit, notion_page_t
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     
     CURLcode res = curl_easy_perform(curl);
-    
-    if (res == CURLE_OK && rsp.data) {
-        *out_count = 0;
+    *out_count = 0;
+    if (res != CURLE_OK || !rsp.data) {
+        free(rsp.data);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return -1;
     }
-    
+    /* Parse "results" array: each element has "id", "url", and properties.title.title[0].plain_text */
+    const char *results = strstr(rsp.data, "\"results\":");
+    if (results) {
+        results = strchr(results, '[');
+        if (results) results++;
+        while (results && *out_count < (size_t)limit) {
+            const char *id_start = strstr(results, "\"id\":\"");
+            if (!id_start) break;
+            id_start += 6;
+            notion_page_t *page = &out_pages[*out_count];
+            memset(page, 0, sizeof(notion_page_t));
+            size_t k = 0;
+            while (id_start[k] && id_start[k] != '"' && k < sizeof(page->id) - 1) {
+                page->id[k] = id_start[k];
+                k++;
+            }
+            page->id[k] = '\0';
+            const char *url_start = strstr(id_start, "\"url\":\"");
+            if (url_start) {
+                url_start += 7;
+                k = 0;
+                while (url_start[k] && url_start[k] != '"' && k < sizeof(page->url) - 1) {
+                    page->url[k] = url_start[k];
+                    k++;
+                }
+                page->url[k] = '\0';
+            }
+            const char *plain = strstr(results, "\"plain_text\":\"");
+            if (plain) {
+                plain += 14;
+                k = 0;
+                while (plain[k] && plain[k] != '"' && k < sizeof(page->title) - 1) {
+                    if (plain[k] == '\\' && plain[k + 1]) k++;
+                    page->title[k] = plain[k];
+                    k++;
+                }
+                page->title[k] = '\0';
+            }
+            (*out_count)++;
+            results = strchr(id_start, '}');
+            if (!results) break;
+            results = strchr(results + 1, '{');
+        }
+    }
     free(rsp.data);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    
     return 0;
 }
 
@@ -536,7 +617,41 @@ int notion_get_page(const char *token, const char *page_id, notion_page_t *out) 
     if (!token || !page_id || !out) return -1;
     memset(out, 0, sizeof(notion_page_t));
     snprintf(out->id, sizeof(out->id), "%s", page_id);
-    return 0;
+    char url[320];
+    snprintf(url, sizeof(url), "https://api.notion.com/v1/pages/%s", page_id);
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Notion-Version: 2022-06-28");
+    char auth[256];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+    headers = curl_slist_append(headers, auth);
+    curl_response_t rsp = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rsp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK && rsp.data) {
+        parse_json_string(rsp.data, "id", out->id, sizeof(out->id));
+        parse_json_string(rsp.data, "url", out->url, sizeof(out->url));
+        const char *plain = strstr(rsp.data, "\"plain_text\":\"");
+        if (plain) {
+            plain += 14;
+            size_t k = 0;
+            while (plain[k] && plain[k] != '"' && k < sizeof(out->title) - 1) {
+                if (plain[k] == '\\' && plain[k + 1]) k++;
+                out->title[k] = plain[k];
+                k++;
+            }
+        }
+    }
+    free(rsp.data);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? 0 : -1;
 }
 
 int notion_create_page(const char *token, const char *parent_id, const char *title, const char *content, char *out_id, size_t id_size) {

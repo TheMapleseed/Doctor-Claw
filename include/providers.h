@@ -92,6 +92,7 @@ typedef struct {
 typedef struct {
     char *data;
     size_t size;
+    long http_status;  /* 0 if not set; set by http_get/http_post */
 } http_response_t;
 
 typedef struct {

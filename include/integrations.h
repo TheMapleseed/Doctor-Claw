@@ -37,6 +37,7 @@ typedef struct {
     char github_token[256];
     char jira_token[256];
     char slack_token[256];
+    char notion_token[256];
 } integrations_manager_t;
 
 typedef struct {

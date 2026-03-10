@@ -10,7 +10,11 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
+#include <signal.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 #include "config.h"
 #include "providers.h"
@@ -39,10 +43,12 @@
 #include "gateway.h"
 #include "jobcache.h"
 #include "jobworker.h"
+#include "instance.h"
 #include "observability.h"
 #include "log.h"
 #include "migration.h"
 #include "cron.h"
+#include "pentest.h"
 
 typedef enum {
     CMD_ONBOARD,
@@ -64,10 +70,19 @@ typedef enum {
     CMD_PERIPHERAL,
     CMD_VERIFY_TASK_FOCUS,
     CMD_LOG,
+    CMD_PENTEST,
+    CMD_STOP,
+    CMD_TEST,
     CMD_UNKNOWN
 } command_t;
 
 static bool g_verbose = false;
+static volatile sig_atomic_t g_daemon_shutdown = 0;
+
+static void daemon_signal_handler(int sig) {
+    (void)sig;
+    g_daemon_shutdown = 1;
+}
 
 static void print_version(void) {
     printf("%s v%s\n", DoctorClaw_NAME, DoctorClaw_VERSION);
@@ -96,6 +111,9 @@ static void print_usage(const char *prog) {
     printf("  peripheral     Manage hardware peripherals\n");
     printf("  verify-task-focus  Verify task-focus (attention loop) functionality\n");
     printf("  log            Logging utilities (export)\n");
+    printf("  pentest        Run security penetration tests against gateway\n");
+    printf("  stop           Gracefully stop the running daemon (sends SIGTERM)\n");
+    printf("  test           Run runtime tests (then exit; use from CLI or model)\n");
     printf("\nOptions:\n");
     printf("  -h, --help     Show this help message\n");
     printf("  -v, --version  Show version information\n");
@@ -122,6 +140,9 @@ static command_t parse_command(const char *cmd) {
     if (strcmp(cmd, "peripheral") == 0) return CMD_PERIPHERAL;
     if (strcmp(cmd, "verify-task-focus") == 0) return CMD_VERIFY_TASK_FOCUS;
     if (strcmp(cmd, "log") == 0) return CMD_LOG;
+    if (strcmp(cmd, "pentest") == 0) return CMD_PENTEST;
+    if (strcmp(cmd, "stop") == 0) return CMD_STOP;
+    if (strcmp(cmd, "test") == 0) return CMD_TEST;
     return CMD_UNKNOWN;
 }
 
@@ -348,7 +369,9 @@ static int cmd_daemon(int argc, char **argv) {
         runtime_shutdown();
         return -1;
     }
-    jobworker_pool_t *pool = jobworker_pool_create(cache, NULL, &cfg, 2, 16);
+    instance_init();
+    instance_register("default", &cfg);
+    jobworker_pool_t *pool = jobworker_pool_create(cache, instance_get_config, &cfg, 2, 16);
     if (!pool) {
         jobcache_destroy(cache);
         runtime_stop();
@@ -364,6 +387,7 @@ static int cmd_daemon(int argc, char **argv) {
     }
     cron_set_jobcache(cache);
     
+    log_info("Daemon started PID=%d gateway=http://%s:%u workers=2-16", getpid(), cfg.gateway.host[0] ? cfg.gateway.host : "0.0.0.0", (unsigned)port);
     printf("Daemon started with PID: %d\n", getpid());
     printf("State: Running\n");
     printf("Uptime: %lu seconds\n", (unsigned long)info.uptime_seconds);
@@ -389,26 +413,134 @@ static int cmd_daemon(int argc, char **argv) {
         }
     }
 
-    printf("\nDaemon running... (Press Ctrl+C to stop)\n");
+    printf("\nDaemon running... (Press Ctrl+C or run 'doctorclaw stop' to stop)\n");
     cron_set_workspace(cfg.paths.state_dir);
     cron_init();
 
-    while (1) {
+    signal(SIGINT, daemon_signal_handler);
+    signal(SIGTERM, daemon_signal_handler);
+
+    char pid_path[512];
+    snprintf(pid_path, sizeof(pid_path), "%s/doctorclaw.pid", cfg.paths.state_dir[0] ? cfg.paths.state_dir : ".");
+    FILE *pf = fopen(pid_path, "w");
+    if (pf) {
+        fprintf(pf, "%d\n", getpid());
+        fclose(pf);
+    }
+
+    /* Optional: run runtime tests once at startup. Set DOCTORCLAW_RUN_STARTUP_TESTS=1. Tests run in a child, complete and shut down; main loop keeps running. */
+    if (getenv("DOCTORCLAW_RUN_STARTUP_TESTS") != NULL && getenv("DOCTORCLAW_RUN_STARTUP_TESTS")[0] != '0') {
+        const char *test_bin = getenv("DOCTORCLAW_TEST_BIN");
+        char path_buf[1024];
+        if (!test_bin || !test_bin[0]) {
+            snprintf(path_buf, sizeof(path_buf), "bin/doctorclaw_test");
+            if (access(path_buf, X_OK) != 0) snprintf(path_buf, sizeof(path_buf), "doctorclaw_test");
+            test_bin = path_buf;
+        } else {
+            snprintf(path_buf, sizeof(path_buf), "%s", test_bin);
+            test_bin = path_buf;
+        }
+        pid_t tpid = fork();
+        if (tpid == 0) {
+            execl(test_bin, "doctorclaw_test", (char *)NULL);
+            execlp("doctorclaw_test", "doctorclaw_test", (char *)NULL);
+            _exit(127);
+        }
+        if (tpid > 0) {
+            int tstatus = 0;
+            while (waitpid(tpid, &tstatus, 0) < 0 && errno == EINTR) { /* spin */ }
+            printf("[Daemon] Startup tests completed (exit %d)\n", WIFEXITED(tstatus) ? WEXITSTATUS(tstatus) : -1);
+        }
+    }
+
+    while (!g_daemon_shutdown) {
         cron_run_pending();
-        sleep(10);
+        for (int i = 0; i < 10 && !g_daemon_shutdown; i++) sleep(1);
         runtime_get_info(&info);
         if (g_verbose) printf(".");
     }
+
+    log_info("Daemon shutting down gracefully");
+    printf("\nShutting down gracefully...\n");
+    gateway_request_shutdown();
+    pthread_join(gateway_thread, NULL);
+    (void)unlink(pid_path);
 
     cron_set_jobcache(NULL);
     jobworker_pool_stop(pool);
     jobworker_pool_destroy(pool);
     jobcache_destroy(cache);
+    instance_shutdown();
     cron_shutdown();
     runtime_stop();
     runtime_shutdown();
-    
+
+    printf("Daemon stopped.\n");
     return 0;
+}
+
+static int cmd_stop(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    config_t cfg;
+    config_load(NULL, &cfg);
+    char pid_path[512];
+    snprintf(pid_path, sizeof(pid_path), "%s/doctorclaw.pid",
+             cfg.paths.state_dir[0] ? cfg.paths.state_dir : ".");
+    FILE *pf = fopen(pid_path, "r");
+    if (!pf) {
+        fprintf(stderr, "No daemon PID file at %s (daemon not running?)\n", pid_path);
+        return 1;
+    }
+    int pid = 0;
+    if (fscanf(pf, "%d", &pid) != 1 || pid <= 0) {
+        fclose(pf);
+        fprintf(stderr, "Invalid PID file\n");
+        return 1;
+    }
+    fclose(pf);
+    if (kill(pid, SIGTERM) != 0) {
+        fprintf(stderr, "Failed to send SIGTERM to PID %d: %s\n", pid, strerror(errno));
+        return 1;
+    }
+    printf("Sent SIGTERM to daemon (PID %d). It will shut down gracefully.\n", pid);
+    return 0;
+}
+
+static int cmd_test(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    char path_buf[1024];
+    const char *test_bin = getenv("DOCTORCLAW_TEST_BIN");
+    if (test_bin && test_bin[0]) {
+        snprintf(path_buf, sizeof(path_buf), "%s", test_bin);
+        test_bin = path_buf;
+    } else {
+        const char *try_paths[] = { "bin/doctorclaw_test", "./bin/doctorclaw_test", NULL };
+        test_bin = NULL;
+        for (size_t i = 0; try_paths[i] != NULL; i++) {
+            snprintf(path_buf, sizeof(path_buf), "%s", try_paths[i]);
+            if (access(path_buf, X_OK) == 0) {
+                test_bin = path_buf;
+                break;
+            }
+        }
+        if (!test_bin) test_bin = "doctorclaw_test"; /* last resort: from PATH */
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0) {
+        if (test_bin != path_buf) execlp(test_bin, "doctorclaw_test", (char *)NULL);
+        execl(test_bin, "doctorclaw_test", (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { /* spin */ }
+    if (!WIFEXITED(status)) return 1;
+    return WEXITSTATUS(status);
 }
 
 static int cmd_service(int argc, char **argv) {
@@ -615,14 +747,47 @@ static int cmd_providers(int argc, char **argv) {
     printf("  copilot          GitHub Copilot\n");
     printf("  compatible       OpenAI-compatible API\n");
     
-    printf("\nEnvironment Variables:\n");
-    printf("  OPENROUTER_API_KEY    - OpenRouter API key\n");
-    printf("  OPENAI_API_KEY       - OpenAI API key\n");
-    printf("  ANTHROPIC_API_KEY    - Anthropic API key\n");
-    printf("  GEMINI_API_KEY       - Google Gemini API key\n");
-    printf("  OLLAMA_HOST          - Ollama host (default: localhost:11434)\n");
-    printf("  LLAMA_MODEL_PATH     - Path to GGUF model file\n");
-    
+    printf("\nEnvironment Variables (all keys detected at startup; config overrides from env):\n");
+    static const struct { const char *name; const char *desc; } env_descriptions[] = {
+        { "DOCTORCLAW_WORKSPACE", "Override workspace/state/data dirs" },
+        { "DOCTORCLAW_CONFIG", "Config file path" },
+        { "DOCTORCLAW_PROVIDER", "Default provider (openrouter, openai, anthropic, gemini, llama, ollama, ...)" },
+        { "DOCTORCLAW_MODEL", "Default model name" },
+        { "DOCTORCLAW_GATEWAY_PORT", "Gateway port" },
+        { "DOCTORCLAW_GATEWAY_HOST", "Gateway host bind" },
+        { "DOCTORCLAW_LLAMA_MODEL", "Path to GGUF model (when provider=llama)" },
+        { "DOCTORCLAW_LOG_FILE", "Log file path" },
+        { "DOCTORCLAW_RUN_STARTUP_TESTS", "Set to 1 to run tests once at daemon start" },
+        { "DOCTORCLAW_TEST_BIN", "Path to doctorclaw_test binary" },
+        { "DOCTORCLAW_HEALTH_SECRET", "Optional secret for GET /health" },
+        { "DOCTORCLAW_SHELL", "Shell for tool execution (default /bin/sh)" },
+        { "OPENROUTER_API_KEY", "OpenRouter API key" },
+        { "OPENAI_API_KEY", "OpenAI API key" },
+        { "ANTHROPIC_API_KEY", "Anthropic API key" },
+        { "GEMINI_API_KEY", "Google Gemini API key" },
+        { "GITHUB_TOKEN", "GitHub/Copilot and integrations" },
+        { "OLLAMA_HOST", "Ollama host (default localhost:11434)" },
+        { "JIRA_API_TOKEN", "Jira integration (Bearer)" },
+        { "NOTION_API_KEY", "Notion integration" },
+        { "HOME", "User home (paths)" },
+        { "USER", "Username" },
+        { "HTTP_PROXY", "HTTP proxy" },
+        { "HTTPS_PROXY", "HTTPS proxy" },
+        { "NO_PROXY", "No-proxy list" },
+        { NULL, NULL }
+    };
+    for (int i = 0; i < config_env_var_count(); i++) {
+        const char *name = config_env_var_name(i);
+        if (!name) continue;
+        const char *desc = "";
+        for (int j = 0; env_descriptions[j].name; j++)
+            if (strcmp(env_descriptions[j].name, name) == 0) {
+                desc = env_descriptions[j].desc;
+                break;
+            }
+        const char *set = getenv(name) && getenv(name)[0] ? " (set)" : "";
+        printf("  %-28s - %s%s\n", name, desc, set);
+    }
     return 0;
 }
 
@@ -1108,6 +1273,23 @@ int main(int argc, char **argv) {
             break;
         case CMD_LOG:
             result = cmd_log(new_argc, new_argv);
+            break;
+        case CMD_PENTEST: {
+            const char *base = (new_argc >= 1 && new_argv[0]) ? new_argv[0] : "http://127.0.0.1:8080";
+            if (providers_init() != 0) {
+                fprintf(stderr, "pentest: providers init failed\n");
+                result = 1;
+            } else {
+                result = pentest_run(base);
+                providers_shutdown();
+            }
+            break;
+        }
+        case CMD_STOP:
+            result = cmd_stop(new_argc, new_argv);
+            break;
+        case CMD_TEST:
+            result = cmd_test(new_argc, new_argv);
             break;
         default:
             fprintf(stderr, "Command not implemented yet\n");

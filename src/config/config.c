@@ -66,10 +66,14 @@ void config_init_defaults(config_t *cfg) {
     memset(cfg, 0, sizeof(config_t));
 
     const char *home = getenv("HOME");
-    if (home) {
+    if (home && home[0]) {
         snprintf(cfg->paths.workspace_dir, MAX_PATH_LEN, "%s/.doctorclaw", home);
         snprintf(cfg->paths.state_dir, MAX_PATH_LEN, "%s/.doctorclaw/state", home);
         snprintf(cfg->paths.data_dir, MAX_PATH_LEN, "%s/.doctorclaw/data", home);
+    } else {
+        snprintf(cfg->paths.workspace_dir, MAX_PATH_LEN, ".doctorclaw");
+        snprintf(cfg->paths.state_dir, MAX_PATH_LEN, ".doctorclaw/state");
+        snprintf(cfg->paths.data_dir, MAX_PATH_LEN, ".doctorclaw/data");
     }
 
     snprintf(cfg->provider.provider, MAX_PROVIDER_NAME_LEN, "openrouter");
@@ -209,6 +213,31 @@ int config_load(const char *path, config_t *cfg) {
     return 0;
 }
 
+/* Canonical list of all environment variable names the binary uses or documents. */
+static const char *const ENV_VAR_NAMES[] = {
+    "DOCTORCLAW_WORKSPACE", "DOCTORCLAW_CONFIG", "DOCTORCLAW_PROVIDER", "DOCTORCLAW_MODEL",
+    "DOCTORCLAW_GATEWAY_PORT", "DOCTORCLAW_GATEWAY_HOST",
+    "DOCTORCLAW_LLAMA_MODEL", "DOCTORCLAW_LOG_FILE", "DOCTORCLAW_RUN_STARTUP_TESTS",
+    "DOCTORCLAW_TEST_BIN", "DOCTORCLAW_HEALTH_SECRET", "DOCTORCLAW_SHELL",
+    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+    "GITHUB_TOKEN", "OLLAMA_HOST",
+    "JIRA_API_TOKEN", "NOTION_API_KEY",
+    "HOME", "USER", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    NULL
+};
+
+int config_env_var_count(void) {
+    int n = 0;
+    while (ENV_VAR_NAMES[n]) n++;
+    return n;
+}
+
+const char *config_env_var_name(int i) {
+    int n = config_env_var_count();
+    if (i < 0 || i >= n) return NULL;
+    return ENV_VAR_NAMES[i];
+}
+
 int config_load_from_env(config_t *cfg) {
     if (!cfg) return -1;
     const char *v;
@@ -245,6 +274,14 @@ int config_load_from_env(config_t *cfg) {
                 snprintf(cfg->provider.provider, MAX_PROVIDER_NAME_LEN, "anthropic");
         }
     }
+    if (!cfg->provider.api_key[0]) {
+        v = getenv("GEMINI_API_KEY");
+        if (v && v[0]) {
+            snprintf(cfg->provider.api_key, MAX_API_KEY_LEN, "%s", v);
+            if (!cfg->provider.provider[0])
+                snprintf(cfg->provider.provider, MAX_PROVIDER_NAME_LEN, "gemini");
+        }
+    }
     v = getenv("DOCTORCLAW_PROVIDER");
     if (v && v[0])
         snprintf(cfg->provider.provider, MAX_PROVIDER_NAME_LEN, "%s", v);
@@ -257,6 +294,12 @@ int config_load_from_env(config_t *cfg) {
     v = getenv("DOCTORCLAW_GATEWAY_HOST");
     if (v && v[0])
         snprintf(cfg->gateway.host, sizeof(cfg->gateway.host), "%s", v);
+    v = getenv("OLLAMA_HOST");
+    if (v && v[0])
+        snprintf(cfg->provider.ollama_host, sizeof(cfg->provider.ollama_host), "%s", v);
+    v = getenv("DOCTORCLAW_LLAMA_MODEL");
+    if (v && v[0])
+        snprintf(cfg->provider.llama_model_path, sizeof(cfg->provider.llama_model_path), "%s", v);
 
     return 0;
 }
@@ -264,17 +307,11 @@ int config_load_from_env(config_t *cfg) {
 int config_env_summary(char *buf, size_t buf_size) {
     if (!buf || buf_size == 0) return -1;
     buf[0] = '\0';
-    const char *env_vars[] = {
-        "DOCTORCLAW_WORKSPACE", "DOCTORCLAW_CONFIG", "DOCTORCLAW_PROVIDER", "DOCTORCLAW_MODEL",
-        "DOCTORCLAW_GATEWAY_PORT", "DOCTORCLAW_GATEWAY_HOST",
-        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN",
-        "HOME", "USER", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", NULL
-    };
     size_t off = 0;
-    for (int i = 0; env_vars[i] && off < buf_size - 2; i++) {
-        const char *v = getenv(env_vars[i]);
+    for (int i = 0; ENV_VAR_NAMES[i] && off < buf_size - 2; i++) {
+        const char *v = getenv(ENV_VAR_NAMES[i]);
         int n = snprintf(buf + off, buf_size - off, "%s%s%s", i ? " " : "",
-                         env_vars[i], v && v[0] ? "(set)" : "");
+                         ENV_VAR_NAMES[i], v && v[0] ? "(set)" : "");
         if (n > 0 && (size_t)n < buf_size - off)
             off += (size_t)n;
         else

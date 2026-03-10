@@ -1,4 +1,5 @@
 #include "providers.h"
+#include "llama.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -210,6 +211,7 @@ int http_post(const char *url, const char *headers[], size_t header_count,
     
     response->data = malloc(1);
     response->size = 0;
+    response->http_status = 0;
     
     struct curl_slist *header_list = NULL;
     for (size_t i = 0; i < header_count; i++) {
@@ -231,6 +233,7 @@ int http_post(const char *url, const char *headers[], size_t header_count,
     
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    response->http_status = http_code;
     
     if (header_list) {
         curl_slist_free_all(header_list);
@@ -251,6 +254,7 @@ int http_get(const char *url, const char *headers[], size_t header_count,
     
     response->data = malloc(1);
     response->size = 0;
+    response->http_status = 0;
     
     struct curl_slist *header_list = NULL;
     for (size_t i = 0; i < header_count; i++) {
@@ -269,6 +273,10 @@ int http_get(const char *url, const char *headers[], size_t header_count,
     }
     
     CURLcode res = curl_easy_perform(curl);
+    
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    response->http_status = http_code;
     
     if (header_list) {
         curl_slist_free_all(header_list);
@@ -648,7 +656,12 @@ static int provider_ollama_completion(
     char body[16384];
     char messages_json[8192];
     
-    snprintf(url, sizeof(url), "http://localhost:11434/api/chat");
+    const char *host = getenv("OLLAMA_HOST");
+    if (!host || !host[0]) host = "http://localhost:11434";
+    if (strncmp(host, "http://", 7) != 0 && strncmp(host, "https://", 8) != 0)
+        snprintf(url, sizeof(url), "http://%s/api/chat", host);
+    else
+        snprintf(url, sizeof(url), "%s/api/chat", host);
     
     build_messages_json(context, messages_json, sizeof(messages_json));
     
@@ -672,6 +685,82 @@ static int provider_ollama_completion(
     
     http_response_free(&resp);
     return result;
+}
+
+static void build_prompt_from_context(const chat_context_t *context, char *prompt, size_t prompt_len) {
+    if (!context || !prompt || prompt_len == 0) return;
+    prompt[0] = '\0';
+    for (size_t i = 0; i < context->message_count && prompt_len > 1; i++) {
+        size_t used = strlen(prompt);
+        int n = snprintf(prompt + used, prompt_len - used, "%s: %s\n",
+                         context->messages[i].role,
+                         context->messages[i].content);
+        if (n < 0 || (size_t)n >= prompt_len - used) break;
+    }
+}
+
+static int provider_llama_completion(
+    const char *model,
+    const chat_context_t *context,
+    chat_response_t *response
+) {
+    const char *path = getenv("DOCTORCLAW_LLAMA_MODEL");
+    if (!path || !path[0]) {
+        path = (model && model[0]) ? model : NULL;
+    }
+    if (!path || !path[0]) {
+        snprintf(response->content, sizeof(response->content),
+                 "Error: Llama provider requires DOCTORCLAW_LLAMA_MODEL or model path (GGUF file).");
+        response->done = true;
+        return -1;
+    }
+
+    static llama_model_t s_model = {0};
+    static char s_last_path[MAX_MODEL_PATH] = {0};
+    bool path_changed = (strcmp(s_last_path, path) != 0);
+    if (path_changed && llama_is_loaded(&s_model)) {
+        llama_unload_model(&s_model);
+        s_last_path[0] = '\0';
+    }
+    if (!llama_is_loaded(&s_model)) {
+        if (llama_load_model(&s_model, path) != 0) {
+            snprintf(response->content, sizeof(response->content),
+                     "Error: Failed to load GGUF model: %s (set DOCTORCLAW_LLAMA_MODEL or install libllama).", path);
+            response->done = true;
+            return -1;
+        }
+        snprintf(s_last_path, sizeof(s_last_path), "%s", path);
+    }
+
+    char prompt_buf[8192];
+    build_prompt_from_context(context, prompt_buf, sizeof(prompt_buf));
+    if (strlen(prompt_buf) == 0) {
+        snprintf(response->content, sizeof(response->content), "Error: Empty prompt for llama.");
+        response->done = true;
+        return -1;
+    }
+
+    llama_response_t ll_resp = {0};
+    size_t max_tok = (context->max_tokens > 0) ? context->max_tokens : 512;
+    double temp = (context->temperature > 0.0) ? (float)context->temperature : 0.8f;
+    int r = llama_chat_completion_with_config(
+        &s_model,
+        prompt_buf,
+        temp,
+        -1,
+        max_tok,
+        &ll_resp
+    );
+    if (r != 0) {
+        snprintf(response->content, sizeof(response->content), "%s",
+                 ll_resp.text[0] ? ll_resp.text : "Error: Llama completion failed.");
+        response->done = true;
+        return -1;
+    }
+    snprintf(response->content, sizeof(response->content), "%s", ll_resp.text);
+    response->completion_tokens = ll_resp.tokens_generated;
+    response->done = ll_resp.done;
+    return 0;
 }
 
 static int provider_copilot_completion(
@@ -734,7 +823,7 @@ int provider_chat_completion(
         }
     }
     
-    if (!api_key && type != PROVIDER_OLLAMA) {
+    if (!api_key && type != PROVIDER_OLLAMA && type != PROVIDER_LLAMA) {
         snprintf(response->content, sizeof(response->content),
                  "Error: No API key configured. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or GEMINI_API_KEY");
         response->done = true;
@@ -810,11 +899,13 @@ int provider_chat_completion(
         }
             
         case PROVIDER_LLAMA:
-            snprintf(response->content, sizeof(response->content),
-                     "Error: llama.cpp requires loading a GGUF model. Use the llama CLI tool directly.");
-            response->done = true;
-            return -1;
-            
+            result = provider_llama_completion(
+                model,
+                context,
+                response
+            );
+            break;
+
         case PROVIDER_CUSTOM:
         case PROVIDER_UNKNOWN:
         default:

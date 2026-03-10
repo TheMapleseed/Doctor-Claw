@@ -10,6 +10,21 @@
 static audit_entry_t g_audit_log[MAX_AUDIT_ENTRIES];
 static size_t g_audit_count = 0;
 
+/* Simple 64-bit chain hash for tamper-evident audit (Merkle-style). Replace with SHA-256 when available. */
+static uint64_t chain_hash(const char *data, size_t len) {
+    uint64_t h = 0x811c9dc5u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)data[i];
+        h *= 0x01000193u;
+    }
+    uint64_t h2 = 0x01000193u;
+    for (size_t i = 0; i < len; i++) {
+        h2 += (unsigned char)data[i];
+        h2 = (h2 * 31u) + (h2 >> 32);
+    }
+    return (h << 32) | (h2 & 0xffffffffu);
+}
+
 static secret_t g_secrets[64];
 static size_t g_secret_count = 0;
 
@@ -155,11 +170,26 @@ int security_audit_log(const char *action, const char *target, bool allowed) {
         g_audit_count = MAX_AUDIT_ENTRIES - 1;
     }
     
-    snprintf(g_audit_log[g_audit_count].action, sizeof(g_audit_log[0].action), "%s", action);
-    snprintf(g_audit_log[g_audit_count].target, sizeof(g_audit_log[0].target), "%s", target ? target : "");
-    snprintf(g_audit_log[g_audit_count].user, sizeof(g_audit_log[0].user), "doctorclaw");
-    g_audit_log[g_audit_count].timestamp = time(NULL);
-    g_audit_log[g_audit_count].allowed = allowed;
+    size_t idx = g_audit_count;
+    snprintf(g_audit_log[idx].action, sizeof(g_audit_log[0].action), "%s", action);
+    snprintf(g_audit_log[idx].target, sizeof(g_audit_log[0].target), "%s", target ? target : "");
+    snprintf(g_audit_log[idx].user, sizeof(g_audit_log[0].user), "doctorclaw");
+    g_audit_log[idx].timestamp = time(NULL);
+    g_audit_log[idx].allowed = allowed;
+    
+    /* Merkle-style chain: previous_hash = last entry's current_hash; current_hash = H(previous || this entry) */
+    if (idx > 0) {
+        snprintf(g_audit_log[idx].previous_hash, sizeof(g_audit_log[0].previous_hash), "%s", g_audit_log[idx - 1].current_hash);
+    } else {
+        g_audit_log[idx].previous_hash[0] = '0';
+        g_audit_log[idx].previous_hash[1] = '\0';
+    }
+    char payload[512];
+    snprintf(payload, sizeof(payload), "%s%s%s%llu%d", g_audit_log[idx].previous_hash, g_audit_log[idx].action, g_audit_log[idx].target,
+             (unsigned long long)g_audit_log[idx].timestamp, allowed ? 1 : 0);
+    uint64_t h = chain_hash(payload, strlen(payload));
+    snprintf(g_audit_log[idx].current_hash, sizeof(g_audit_log[0].current_hash), "%016llx", (unsigned long long)h);
+    
     g_audit_count++;
     
     return 0;

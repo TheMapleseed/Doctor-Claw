@@ -15,6 +15,8 @@ static void remove_temp_workspace(const char *path) {
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/memory.db", path);
     unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/muninn.db", path);
+    unlink(db_path);
     rmdir(path);
 }
 
@@ -22,6 +24,7 @@ static int test_memory_classify(void) {
     TEST_BEGIN();
     ASSERT_EQ(memory_classify("sqlite"), MEMORY_BACKEND_SQLITE);
     ASSERT_EQ(memory_classify("markdown"), MEMORY_BACKEND_MARKDOWN);
+    ASSERT_EQ(memory_classify("muninn"), MEMORY_BACKEND_MUNINN);
     ASSERT_EQ(memory_classify("none"), MEMORY_BACKEND_NONE);
     ASSERT_EQ(memory_classify("unknown_xyz"), MEMORY_BACKEND_UNKNOWN);
     TEST_END();
@@ -78,6 +81,30 @@ static int test_memory_create_invalid(void) {
     TEST_END();
 }
 
+static int test_memory_muninn_backend(void) {
+    TEST_BEGIN();
+    char workspace[256];
+    make_temp_workspace(workspace, sizeof(workspace));
+    memory_t mem = {0};
+    int r = memory_create("muninn", workspace, &mem);
+    ASSERT_EQ(r, 0);
+    ASSERT_TRUE(mem.initialized);
+    memory_item_t item = {0};
+    snprintf(item.key, sizeof(item.key), "database");
+    snprintf(item.value, sizeof(item.value), "PostgreSQL 15 with pgvector");
+    item.timestamp = 0;
+    r = memory_store(&mem, &item);
+    ASSERT_EQ(r, 0);
+    memory_item_t out = {0};
+    r = memory_recall(&mem, "database", &out);
+    ASSERT_EQ(r, 0);
+    ASSERT_STR_EQ(out.key, "database");
+    ASSERT_STR_EQ(out.value, "PostgreSQL 15 with pgvector");
+    memory_free(&mem);
+    remove_temp_workspace(workspace);
+    TEST_END();
+}
+
 int test_memory_run(void) {
     int failed = 0;
     printf("  memory: classify\n");
@@ -86,5 +113,7 @@ int test_memory_run(void) {
     if (test_memory_create_store_recall_delete() != 0) failed++;
     printf("  memory: create invalid args\n");
     if (test_memory_create_invalid() != 0) failed++;
+    printf("  memory: muninn backend\n");
+    if (test_memory_muninn_backend() != 0) failed++;
     return failed;
 }

@@ -3,6 +3,8 @@
 #include "memory.h"
 #include "tools.h"
 #include "rag.h"
+#include "runtime_monitor.h"
+#include "loop_guard.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -275,11 +277,39 @@ static const char *g_default_tools = "[\n"
 "    \"type\": \"function\",\n"
 "    \"function\": {\n"
 "      \"name\": \"shell\",\n"
-"      \"description\": \"Execute a shell command and return the output\",\n"
+"      \"description\": \"Execute a shell command and return the output (uses DOCTORCLAW_SHELL or /bin/sh)\",\n"
 "      \"parameters\": {\n"
 "        \"type\": \"object\",\n"
 "        \"properties\": {\n"
 "          \"command\": {\"type\": \"string\", \"description\": \"The shell command to execute\"}\n"
+"        },\n"
+"        \"required\": [\"command\"]\n"
+"      }\n"
+"    }\n"
+"  },\n"
+"  {\n"
+"    \"type\": \"function\",\n"
+"    \"function\": {\n"
+"      \"name\": \"zsh\",\n"
+"      \"description\": \"Execute a command in zsh (use for zsh-specific features or direct network stack control)\",\n"
+"      \"parameters\": {\n"
+"        \"type\": \"object\",\n"
+"        \"properties\": {\n"
+"          \"command\": {\"type\": \"string\", \"description\": \"The command to run in zsh\"}\n"
+"        },\n"
+"        \"required\": [\"command\"]\n"
+"      }\n"
+"    }\n"
+"  },\n"
+"  {\n"
+"    \"type\": \"function\",\n"
+"    \"function\": {\n"
+"      \"name\": \"network\",\n"
+"      \"description\": \"Run a command with direct network stack access (e.g. ip addr, ifconfig, nc, ping)\",\n"
+"      \"parameters\": {\n"
+"        \"type\": \"object\",\n"
+"        \"properties\": {\n"
+"          \"command\": {\"type\": \"string\", \"description\": \"Network command to run\"}\n"
 "        },\n"
 "        \"required\": [\"command\"]\n"
 "      }\n"
@@ -569,6 +599,20 @@ static int agent_execute_tool_by_name(const char *name, const char *args_json, c
             snprintf(result, result_size, "Error: Could not parse shell command");
             return -1;
         }
+    } else if (strcmp(name, "zsh") == 0) {
+        if (sscanf(args_json, "{\"command\":\"%1023[^\"]\"}", path) == 1) {
+            tools_execute("zsh", path, &tr);
+        } else {
+            snprintf(result, result_size, "Error: Could not parse zsh command");
+            return -1;
+        }
+    } else if (strcmp(name, "network") == 0) {
+        if (sscanf(args_json, "{\"command\":\"%1023[^\"]\"}", path) == 1) {
+            tools_execute("network", path, &tr);
+        } else {
+            snprintf(result, result_size, "Error: Could not parse network command");
+            return -1;
+        }
     } else if (strcmp(name, "read_file") == 0) {
         if (sscanf(args_json, "{\"path\":\"%1023[^\"]\"}", path) == 1) {
             tools_execute("read_file", path, &tr);
@@ -621,11 +665,23 @@ static int agent_think_with_tools(agent_t *agent, const char *user_message, char
         agent_load_memory_context(user_message, memory_context, sizeof(memory_context));
     }
     
+    char runtime_alerts[RUNTIME_MONITOR_AGENT_BUF] = {0};
+    if (runtime_monitor_get_recent_for_agent(runtime_alerts, sizeof(runtime_alerts)) == 0) {
+        /* Runtime monitor is optional; if no alerts, we simply don't prepend. */
+    }
+    
     char enriched_message[8192] = {0};
+    size_t off = 0;
+    if (runtime_alerts[0]) {
+        off += (size_t)snprintf(enriched_message + off, sizeof(enriched_message) - off,
+            "%s\n\n", runtime_alerts);
+    }
     if (memory_context[0]) {
-        snprintf(enriched_message, sizeof(enriched_message),
-            "%s\n\nRelevant memory context:\n%s",
-            user_message, memory_context);
+        off += (size_t)snprintf(enriched_message + off, sizeof(enriched_message) - off,
+            "Relevant memory context:\n%s\n\n", memory_context);
+    }
+    if (off > 0) {
+        off += (size_t)snprintf(enriched_message + off, sizeof(enriched_message) - off, "%s", user_message);
         chat_context_add_message(&agent->context, "user", enriched_message);
     } else {
         chat_context_add_message(&agent->context, "user", user_message);
@@ -652,6 +708,7 @@ static int agent_think_with_tools(agent_t *agent, const char *user_message, char
         return -1;
     }
     
+    loop_guard_reset();  /* OpenFang-style: fresh state per turn */
     int iteration = 0;
     int max_iterations = MAX_ITERATIONS;
     
@@ -702,6 +759,13 @@ static int agent_think_with_tools(agent_t *agent, const char *user_message, char
             for (size_t i = 0; i < tool_call_count; i++) {
                 const char *tool_name = parsed_calls[i].name;
                 const char *tool_args = parsed_calls[i].arguments;
+                
+                if (!loop_guard_check(tool_name)) {
+                    char reason[256];
+                    loop_guard_reason(reason, sizeof(reason));
+                    snprintf(response, resp_size, "Loop guard tripped: %s", reason[0] ? reason : "repeated or ping-pong tool calls");
+                    return 0;
+                }
                 
                 printf("[Agent] Tool: %s\n", tool_name);
                 
@@ -819,8 +883,35 @@ int agent_run_task(agent_t *agent, const char *task, char *response, size_t resp
         "Continue with the task. If you have fully completed it, respond with " TASK_COMPLETE_MARKER " and a brief summary. "
         "Otherwise continue with the next steps.";
 
-    char task_message[2048];
-    snprintf(task_message, sizeof(task_message), task_instruction, task);
+    char task_message[4096];
+    size_t task_len = 0;
+    if (agent->workspace_dir[0]) {
+        char rag_path[512];
+        snprintf(rag_path, sizeof(rag_path), "%s/rag.idx", agent->workspace_dir);
+        rag_index_t rag = {0};
+        if (rag_index_load(&rag, rag_path) == 0) {
+            rag_result_t rag_result = {0};
+            if (rag_index_query(&rag, task, 3, &rag_result) == 0 && rag_result.chunk_count > 0) {
+                task_len = (size_t)snprintf(task_message, sizeof(task_message), "Relevant context from RAG:\n");
+                for (size_t i = 0; i < rag_result.chunk_count && task_len < sizeof(task_message) - 512; i++) {
+                    task_len += (size_t)snprintf(task_message + task_len, sizeof(task_message) - task_len,
+                        "[%zu] %s\n", i + 1, rag_result.chunks[i]);
+                }
+                task_len += (size_t)snprintf(task_message + task_len, sizeof(task_message) - task_len, "\n");
+                rag_index_free(&rag);
+            } else {
+                rag_index_free(&rag);
+            }
+        }
+    }
+    if (task_len == 0) {
+        snprintf(task_message, sizeof(task_message), task_instruction, task);
+    } else {
+        size_t rest = sizeof(task_message) - task_len - 64;
+        if (rest > 0) {
+            snprintf(task_message + task_len, rest, task_instruction, task);
+        }
+    }
 
     int round = 0;
     int result = 0;

@@ -1,4 +1,5 @@
 #include "memory.h"
+#include "muninn.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +68,10 @@ int memory_init(memory_t *mem, memory_backend_t backend, const char *storage_pat
         }
     }
     
+    if (backend == MEMORY_BACKEND_MUNINN && storage_path) {
+        return memory_muninn_init(mem, storage_path);
+    }
+    
     return 0;
 }
 
@@ -87,6 +92,10 @@ int memory_store(memory_t *mem, const memory_item_t *item) {
         int result = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         return result == SQLITE_DONE ? 0 : -1;
+    }
+    
+    if (mem->backend == MEMORY_BACKEND_MUNINN && mem->db_handle) {
+        return memory_muninn_store(mem, item);
     }
     
     return -1;
@@ -118,6 +127,10 @@ int memory_recall(memory_t *mem, const char *key, memory_item_t *out_item) {
         }
         sqlite3_finalize(stmt);
         return -1;
+    }
+    
+    if (mem->backend == MEMORY_BACKEND_MUNINN && mem->db_handle) {
+        return memory_muninn_recall(mem, key, out_item);
     }
     
     return -1;
@@ -167,6 +180,8 @@ memory_backend_t memory_classify(const char *backend_name) {
         return MEMORY_BACKEND_MARKDOWN;
     } else if (strcmp(backend_name, "postgres") == 0 || strcmp(backend_name, "PostgresMemory") == 0) {
         return MEMORY_BACKEND_POSTGRES;
+    } else if (strcmp(backend_name, "muninn") == 0 || strcmp(backend_name, "MuninnMemory") == 0) {
+        return MEMORY_BACKEND_MUNINN;
     } else if (strcmp(backend_name, "none") == 0 || strcmp(backend_name, "NoneMemory") == 0) {
         return MEMORY_BACKEND_NONE;
     }
@@ -180,6 +195,7 @@ const char* memory_get_backend_name(memory_backend_t backend) {
         case MEMORY_BACKEND_LUCID: return "lucid";
         case MEMORY_BACKEND_MARKDOWN: return "markdown";
         case MEMORY_BACKEND_POSTGRES: return "postgres";
+        case MEMORY_BACKEND_MUNINN: return "muninn";
         case MEMORY_BACKEND_NONE: return "none";
         default: return "unknown";
     }
@@ -193,10 +209,11 @@ int memory_get_available_backends(memory_backend_info_t *backends, size_t *count
         {"lucid", true, MEMORY_BACKEND_LUCID},
         {"markdown", true, MEMORY_BACKEND_MARKDOWN},
         {"postgres", true, MEMORY_BACKEND_POSTGRES},
+        {"muninn", true, MEMORY_BACKEND_MUNINN},
         {"none", true, MEMORY_BACKEND_NONE},
     };
     
-    size_t max = 5;
+    size_t max = 6;
     for (size_t i = 0; i < max; i++) {
         backends[i] = available[i];
     }
@@ -216,7 +233,11 @@ int memory_create(const char *backend_name, const char *workspace_dir, memory_t 
     }
     
     char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/memory.db", workspace_dir);
+    if (backend == MEMORY_BACKEND_MUNINN) {
+        snprintf(db_path, sizeof(db_path), "%s/muninn.db", workspace_dir);
+    } else {
+        snprintf(db_path, sizeof(db_path), "%s/memory.db", workspace_dir);
+    }
     
     int result = memory_init(mem, backend, db_path);
     if (result != 0) {
@@ -403,6 +424,54 @@ void memory_postgres_free(memory_t *mem) {
     memset(mem, 0, sizeof(memory_t));
 }
 
+int memory_muninn_init(memory_t *mem, const char *storage_path) {
+    if (!mem || !storage_path) return -1;
+    muninn_t *m = (muninn_t *)malloc(sizeof(muninn_t));
+    if (!m) return -1;
+    if (muninn_init(m, storage_path) != 0) {
+        free(m);
+        return -1;
+    }
+    mem->db_handle = m;
+    snprintf(mem->storage_path, sizeof(mem->storage_path), "%s", storage_path);
+    snprintf(mem->name, sizeof(mem->name), "muninn");
+    mem->initialized = true;
+    printf("[Memory] Muninn (cognitive) backend at %s\n", storage_path);
+    return 0;
+}
+
+int memory_muninn_store(memory_t *mem, const memory_item_t *item) {
+    if (!mem || !mem->db_handle || !item) return -1;
+    muninn_t *m = (muninn_t *)mem->db_handle;
+    char id_buf[MUNINN_ID_MAX];
+    return muninn_write(m, MUNINN_DEFAULT_VAULT, item->key, item->value, NULL, 0, id_buf, sizeof(id_buf));
+}
+
+int memory_muninn_recall(memory_t *mem, const char *key, memory_item_t *out_item) {
+    if (!mem || !mem->db_handle || !key || !out_item) return -1;
+    muninn_t *m = (muninn_t *)mem->db_handle;
+    muninn_engram_t results[1];
+    size_t n = 0;
+    if (muninn_activate(m, MUNINN_DEFAULT_VAULT, key, 1, results, &n) != 0 || n == 0) {
+        return -1;
+    }
+    memset(out_item, 0, sizeof(memory_item_t));
+    snprintf(out_item->key, sizeof(out_item->key), "%s", results[0].concept);
+    snprintf(out_item->value, sizeof(out_item->value), "%s", results[0].content);
+    out_item->timestamp = results[0].last_access_sec;
+    return 0;
+}
+
+void memory_muninn_free(memory_t *mem) {
+    if (!mem) return;
+    if (mem->db_handle) {
+        muninn_free((muninn_t *)mem->db_handle);
+        free(mem->db_handle);
+        mem->db_handle = NULL;
+    }
+    mem->initialized = false;
+}
+
 static embedding_config_t g_embedder_config = {0};
 
 int memory_embedder_init(const embedding_config_t *config) {
@@ -525,7 +594,11 @@ int memory_clear(memory_t *mem) {
 
 void memory_free(memory_t *mem) {
     if (!mem) return;
-    
+
+    if (mem->backend == MEMORY_BACKEND_MUNINN && mem->db_handle) {
+        memory_muninn_free(mem);
+        return;
+    }
     if (mem->db_handle) {
         sqlite3_close((sqlite3 *)mem->db_handle);
         mem->db_handle = NULL;

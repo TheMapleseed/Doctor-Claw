@@ -5,6 +5,9 @@
 #include "agent.h"
 #include "observability.h"
 #include "log.h"
+#include "security_monitor.h"
+#include "runtime_monitor.h"
+#include "ids.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +22,17 @@
 #define MAX_REQUEST_SIZE 65536
 #define MAX_RESPONSE_SIZE 65536
 #define MAX_MESSAGE_CONTENT 16384
+
+static volatile int g_gateway_shutdown = 0;
+static int g_gateway_listen_fd = -1;
+
+void gateway_request_shutdown(void) {
+    g_gateway_shutdown = 1;
+    if (g_gateway_listen_fd >= 0) {
+        close(g_gateway_listen_fd);
+        g_gateway_listen_fd = -1;
+    }
+}
 
 typedef struct {
     char method[16];
@@ -129,12 +143,15 @@ int ws_parse_frame(const char *data, size_t len, char *out_message, size_t *out_
 static int ws_send_to_fd(int client_fd, const char *message, size_t len, bool binary);
 
 static void build_http_response(const gateway_response_t *resp, char *out, size_t *out_size) {
+    /* Security headers (OpenFang-inspired: X-Content-Type-Options, X-Frame-Options). */
     snprintf(out, *out_size,
              "HTTP/1.1 %d %s\r\n"
              "Content-Type: %s\r\n"
              "Content-Length: %zu\r\n"
              "Connection: close\r\n"
              "Access-Control-Allow-Origin: *\r\n"
+             "X-Content-Type-Options: nosniff\r\n"
+             "X-Frame-Options: DENY\r\n"
              "\r\n",
              resp->status_code, resp->status_text,
              resp->content_type, resp->body_size);
@@ -231,6 +248,7 @@ static int parse_json_webhook_message(const char *body, char *message, size_t me
 
 typedef struct {
     int client_fd;
+    char client_ip[GATEWAY_CLIENT_IP_MAX];
     config_t *config;
     jobcache_t *jobcache;
 } gateway_client_ctx_t;
@@ -240,7 +258,10 @@ static void handle_request(const http_request_t *req, gateway_response_t *resp, 
 static void *gateway_worker(void *arg) {
     gateway_client_ctx_t *ctx = (gateway_client_ctx_t *)arg;
     int client_fd = ctx->client_fd;
+    char client_ip[GATEWAY_CLIENT_IP_MAX];
+    snprintf(client_ip, sizeof(client_ip), "%s", ctx->client_ip);
     config_t *config = ctx->config;
+    jobcache_t *jobcache = ctx->jobcache;
     free(ctx);
     pthread_detach(pthread_self());
 
@@ -254,6 +275,75 @@ static void *gateway_worker(void *arg) {
 
     http_request_t req;
     parse_http_request(buffer, (size_t)n, &req);
+
+    /* Runtime monitor: record each connection (port-probe detection). */
+    runtime_monitor_connection(client_ip);
+
+    /* Security monitor: injection, rate limit, path traversal (OpenFang-inspired). */
+    {
+        char reason[SECMON_REASON_MAX];
+        security_monitor_result_t sec = security_monitor_check_request(
+            client_ip, req.method, req.path, req.body, req.body_size, reason, sizeof(reason));
+        if (sec != SECMON_OK) {
+            gateway_response_t resp;
+            memset(&resp, 0, sizeof(resp));
+            snprintf(resp.content_type, sizeof(resp.content_type), "application/json");
+            if (sec == SECMON_RATE_LIMITED) {
+                resp.status_code = 429;
+                snprintf(resp.status_text, sizeof(resp.status_text), "Too Many Requests");
+                snprintf(resp.body, sizeof(resp.body), "{\"error\":\"Rate limit exceeded\"}");
+            } else {
+                resp.status_code = 400;
+                snprintf(resp.status_text, sizeof(resp.status_text), "Bad Request");
+                snprintf(resp.body, sizeof(resp.body), "{\"error\":\"Request rejected\",\"reason\":\"%s\"}", reason[0] ? reason : "security");
+            }
+            resp.body_size = strlen(resp.body);
+            security_monitor_audit_reject(sec, client_ip, req.method, req.path, reason);
+            /* Notify user and agent via runtime monitor */
+            {
+                runtime_event_type_t ev = RUNTIME_EVENT_SECURITY_REJECT;
+                if (sec == SECMON_RATE_LIMITED) ev = RUNTIME_EVENT_RATE_LIMIT;
+                else if (sec == SECMON_INJECTION_SUSPECTED) ev = RUNTIME_EVENT_INJECTION;
+                else if (sec == SECMON_PATH_TRAVERSAL) ev = RUNTIME_EVENT_PATH_TRAVERSAL;
+                char detail_buf[256];
+                snprintf(detail_buf, sizeof(detail_buf), "%s %s → %s", req.method, req.path, reason[0] ? reason : "rejected");
+                runtime_monitor_event(ev, "gateway", client_ip, detail_buf);
+            }
+            char response_buf[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
+            size_t resp_size = sizeof(response_buf);
+            build_http_response(&resp, response_buf, &resp_size);
+            send(client_fd, response_buf, resp_size, 0);
+            close(client_fd);
+            return NULL;
+        }
+    }
+
+    /* IDS: signature and anomaly checks (OpenFang-style). */
+    {
+        char reason[IDS_REASON_MAX];
+        ids_result_t ids = ids_check(req.method, req.path, req.body, req.body_size, reason, sizeof(reason));
+        if (ids != IDS_OK) {
+            gateway_response_t resp;
+            memset(&resp, 0, sizeof(resp));
+            resp.status_code = 400;
+            snprintf(resp.status_text, sizeof(resp.status_text), "Bad Request");
+            snprintf(resp.body, sizeof(resp.body), "{\"error\":\"Request rejected\",\"reason\":\"%s\"}", reason[0] ? reason : "ids");
+            resp.body_size = strlen(resp.body);
+            snprintf(resp.content_type, sizeof(resp.content_type), "application/json");
+            security_monitor_audit_reject(SECMON_INJECTION_SUSPECTED, client_ip, req.method, req.path, reason);
+            {
+                char detail_buf[256];
+                snprintf(detail_buf, sizeof(detail_buf), "IDS %s %s → %s", req.method, req.path, reason[0] ? reason : "alert");
+                runtime_monitor_event(RUNTIME_EVENT_OTHER, "gateway", client_ip, detail_buf);
+            }
+            char response_buf[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
+            size_t resp_size = sizeof(response_buf);
+            build_http_response(&resp, response_buf, &resp_size);
+            send(client_fd, response_buf, resp_size, 0);
+            close(client_fd);
+            return NULL;
+        }
+    }
 
     const char *upgrade = get_header(&req, "Upgrade");
     if (upgrade && strcmp(upgrade, "websocket") == 0) {
@@ -275,7 +365,7 @@ static void *gateway_worker(void *arg) {
         }
     } else {
         gateway_response_t resp;
-        handle_request(&req, &resp, config, ctx->jobcache);
+        handle_request(&req, &resp, config, jobcache);
         char response_buf[MAX_REQUEST_SIZE + MAX_RESPONSE_SIZE];
         size_t resp_size = sizeof(response_buf);
         build_http_response(&resp, response_buf, &resp_size);
@@ -332,11 +422,30 @@ static void handle_request(const http_request_t *req, gateway_response_t *resp, 
         snprintf(resp->content_type, sizeof(resp->content_type), "text/html");
         snprintf(resp->body, sizeof(resp->body), g_html_template, "0.1.0");
         resp->body_size = strlen(resp->body);
-    } else if (strcmp(req->path, "/health") == 0) {
+    } else if (strcmp(req->path, "/health") == 0 || (strncmp(req->path, "/health?", 7) == 0)) {
         resp->status_code = 200;
         snprintf(resp->status_text, sizeof(resp->status_text), "OK");
         snprintf(resp->content_type, sizeof(resp->content_type), "application/json");
-        snprintf(resp->body, sizeof(resp->body), "{\"status\":\"healthy\",\"version\":\"0.1.0\"}");
+        /* OpenFang-style: unauthenticated = minimal; full only with Bearer or ?full=secret */
+        const char *auth = get_header(req, "Authorization");
+        const char *secret = getenv("DOCTORCLAW_HEALTH_SECRET");
+        bool full_ok = false;
+        if (secret && secret[0]) {
+            if (auth && strncmp(auth, "Bearer ", 7) == 0 && strcmp(auth + 7, secret) == 0) full_ok = true;
+            else if (strstr(req->path, "full=") != NULL) {
+                const char *q = strstr(req->path, "full=") + 5;
+                char val[128];
+                size_t n = 0;
+                while (n < sizeof(val) - 1 && q[n] && q[n] != '&') { val[n] = q[n]; n++; }
+                val[n] = '\0';
+                if (strcmp(val, secret) == 0) full_ok = true;
+            }
+        }
+        if (full_ok) {
+            snprintf(resp->body, sizeof(resp->body), "{\"status\":\"healthy\",\"version\":\"0.1.0\"}");
+        } else {
+            snprintf(resp->body, sizeof(resp->body), "{\"status\":\"ok\"}");
+        }
         resp->body_size = strlen(resp->body);
     } else if (strcmp(req->path, "/webhook") == 0 || strcmp(req->path, "/webhooks") == 0) {
         resp->status_code = 200;
@@ -501,6 +610,10 @@ int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcac
         snprintf(path, sizeof(path), "%s/channels/config.toml", config->paths.workspace_dir);
         (void)channels_load_config(path);
     }
+    (void)security_monitor_init(NULL);  /* Defaults: rate limit, injection scan, path check, audit */
+    (void)runtime_monitor_init();       /* Runtime alerts → user + agent context */
+    { ids_config_t idsc; ids_config_defaults(&idsc); (void)ids_init(&idsc); }
+
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         perror("socket");
@@ -533,13 +646,15 @@ int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcac
     }
     
     log_info("Gateway listening on http://%s:%d (multi-threaded)", host, port);
+    g_gateway_listen_fd = sockfd;
 
-    while (1) {
+    while (!g_gateway_shutdown) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &client_len);
 
         if (client_fd < 0) {
+            if (g_gateway_shutdown) break;
             perror("accept");
             continue;
         }
@@ -550,6 +665,10 @@ int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcac
             continue;
         }
         ctx->client_fd = client_fd;
+        {
+            const char *ip_str = inet_ntoa(client_addr.sin_addr);
+            snprintf(ctx->client_ip, sizeof(ctx->client_ip), "%s", ip_str ? ip_str : "unknown");
+        }
         ctx->config = config;
         ctx->jobcache = jobcache;
 
@@ -560,7 +679,8 @@ int gateway_run(const char *host, uint16_t port, config_t *config, struct jobcac
         }
     }
 
-    close(sockfd);
+    if (!g_gateway_shutdown && sockfd >= 0) close(sockfd);
+    g_gateway_listen_fd = -1;
     return 0;
 }
 

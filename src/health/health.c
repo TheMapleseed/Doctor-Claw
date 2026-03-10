@@ -77,9 +77,11 @@ int health_run_checks(health_monitor_t *mon) {
 
 health_status_t health_check_provider(void) {
     const char *key = getenv("OPENROUTER_API_KEY");
-    if (!key) key = getenv("OPENAI_API_KEY");
-    if (!key) key = getenv("ANTHROPIC_API_KEY");
-    if (!key) key = getenv("OLLAMA_HOST");
+    if (!key || !key[0]) key = getenv("OPENAI_API_KEY");
+    if (!key || !key[0]) key = getenv("ANTHROPIC_API_KEY");
+    if (!key || !key[0]) key = getenv("GEMINI_API_KEY");
+    if (!key || !key[0]) key = getenv("OLLAMA_HOST");
+    if (!key || !key[0]) key = getenv("DOCTORCLAW_LLAMA_MODEL");
     
     if (key && key[0]) {
         return HEALTH_OK;

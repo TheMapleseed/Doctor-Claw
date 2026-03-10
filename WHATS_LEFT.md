@@ -13,38 +13,32 @@ This list is ordered by impact for a **single-process, cache-orchestrated, task-
 | **3. Config more sections** | INI parser applies `[memory]`, `[autonomy]`, `[observability]`, `[agent]`. |
 | **4. Observability record/export** | `observability_global_init` / `observability_record_global`; gateway records requests and exposes `GET /metrics`. |
 | **5. Channel listeners + reply** | Telegram getUpdates poll thread in daemon; gateway loads channels and calls `channels_reply_to_webhook` so agent replies are sent back to Telegram/Discord/Slack; Slack URL verification for Events API. |
+| **6. RAG in agent** | `agent_chat` loads `workspace_dir/rag.idx`, runs `rag_index_query(message, 5)`, and injects "Relevant context from RAG" into the user message. `agent_run_task` does the same for the initial task message when RAG index exists. |
+| **7. Jira / Notion integrations** | Jira: search_issues, create_issue, and transition_issue use real HTTP. Notion: search (parses results into notion_page_t), get_page (GET + parse), create_page (POST). |
+| **8. Llama.cpp sampling** | `llama_get_logits` dlsym’d; next token is sampled via argmax over logits. Without get_logits, generation stops after prompt (no garbage repeat). |
+| **9. Logging module** | `log.c`/`log.h` with levels, file output, `log export`; gateway/daemon wire it. |
 
 ---
 
-## Incomplete
+## Incomplete / Deferred
 
-### 6. **RAG in agent loop (medium)**
+### Pentest (deferred)
 
-- **Current:** RAG index/query exist but are not used in the agent.
-- **Goal:** Before or after intent, run RAG query on user message or workspace index; inject top chunks into agent context (system or user message).
-- **Touchpoints:** `src/agent/agent.c` (before/after `agent_chat` / tool loop).
+- **Current:** Runtime tests for pentest are skipped (tooling not ready). CLI `doctorclaw pentest [base_url]` still runs the suite when you have a gateway up.
+- **Goal:** When tooling is ready, re-enable pentest tests and any extra checks.
 
-### 7. **Integrations: Jira / Notion (lower)**
+### Migration: `migrate run <source>` — *expanded*
 
-- **Current:** Stubs return placeholder data.
-- **Goal:** Real HTTP + auth to Jira/Notion APIs; fill existing structs and return success/failure.
-- **Touchpoints:** `src/integrations/integrations.c`.
+- **Current:** `migrate run generic /path/to/export.json` imports key-value JSON into memory. Same import is used for `ollama`, `claude`, and `openai` sources when path ends in `.json`.
+- **Goal:** Additional source-specific parsers if needed.
 
-### 8. **Migration: `migrate run <source>`** — *partial (generic JSON)*
+### Multi-instance registry — *done*
 
-- **Current:** `migrate run generic /path/to/export.json` imports into memory.
-- **Goal:** Additional sources if needed.
+- **Current:** `instance` module: `instance_init()`, `instance_register(id, config)`, `instance_get_config(id, &out)`, `instance_shutdown()`. Daemon registers `"default"` and passes `instance_get_config` to the job worker pool so jobs resolve `instance_id` → config. Optional: register more instances for multi-tenant.
 
-### 9. **Logging module (nice to have)** — *done (log.h/log.c, export, levels)*
+### Logging (nice to have)
 
-- **Current:** `log.c`/`log.h` with levels, file output, `log export`; gateway/daemon wire it.
-- **Goal:** Replace remaining `printf` in hot paths if desired.
-
-### 10. **Multi-instance registry (optional)**
-
-- **Current:** Single config; job workers use one `default_config`; `instance_id` in jobs is present but get_config is NULL.
-- **Goal:** If you want multiple logical instances in one process, add an instance registry and wire `jobworker_config_fn` to it.
-- **Touchpoints:** New `instance` module; daemon/gateway to create instances and pass get_config to the worker pool.
+- Replace remaining `printf` in hot paths with the log module if desired.
 
 ---
 
@@ -57,8 +51,12 @@ This list is ordered by impact for a **single-process, cache-orchestrated, task-
 | 3 | Config more sections | Done | — |
 | 4 | Observability record/export | Done | — |
 | 5 | Channel listeners + webhook reply | Done | — |
-| 6 | RAG in agent | Incomplete | Medium |
-| 7 | Jira/Notion integrations | Done (real HTTP) | — |
-| 8 | Migration run | Partial (generic) | Small |
+| 6 | RAG in agent | Done | — |
+| 7 | Jira/Notion integrations | Done | — |
+| 8 | Llama.cpp sampling | Done | — |
 | 9 | Logging module | Done | — |
-| 10 | Multi-instance registry | Optional | Medium |
+| 10 | Pentest | Deferred (tooling not ready) | — |
+| 11 | Migration run | Expanded (generic + ollama/claude/openai JSON) | — |
+| 12 | Multi-instance registry | Done (instance module + daemon get_config) | — |
+| 13 | Health provider check | Done (GEMINI, LLAMA, OLLAMA_HOST) | — |
+| 14 | OLLAMA_HOST in providers | Done (Ollama API base URL from env) | — |

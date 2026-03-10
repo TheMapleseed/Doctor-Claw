@@ -28,6 +28,8 @@ typedef struct {
     char api_url[MAX_URL_LEN];
     char api_key[MAX_API_KEY_LEN];
     bool stream;
+    char ollama_host[256];
+    char llama_model_path[MAX_PATH_LEN];
 } provider_config_t;
 
 typedef struct {
@@ -237,5 +239,9 @@ int config_add_cron_job(config_t *cfg, const char *schedule, const char *command
 
 /** Write a summary of detected env vars (which are set) to buf. Does not print secret values. */
 int config_env_summary(char *buf, size_t buf_size);
+/** Number of environment variable names the binary recognizes (canonical list). */
+int config_env_var_count(void);
+/** Name of the i-th env var (0 <= i < config_env_var_count()); NULL if out of range. */
+const char *config_env_var_name(int i);
 
 #endif

@@ -42,12 +42,16 @@ typedef struct {
     bool default_allow;
 } security_policy_t;
 
+/* Merkle-style chain: each entry has previous_hash and current_hash = H(previous_hash || entry) for tamper-evidence */
+#define AUDIT_HASH_HEX_LEN 16
 typedef struct {
     char action[64];
     char target[256];
     char user[64];
     uint64_t timestamp;
     bool allowed;
+    char previous_hash[AUDIT_HASH_HEX_LEN + 1];  /* chain link */
+    char current_hash[AUDIT_HASH_HEX_LEN + 1];
 } audit_entry_t;
 
 typedef struct {
